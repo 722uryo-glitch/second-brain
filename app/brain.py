@@ -1,3 +1,4 @@
+import asyncio
 from .memory import recall, store_memory
 from .ollama_client import chat
 from .db import recent_memories
@@ -13,8 +14,19 @@ SYSTEM = """あなたはユーザー専用の『第2の脳』です。
 """
 
 
+async def _store_conversation_later(user_text: str, response: str):
+    """Persist conversation after the response is already ready for the user."""
+    try:
+        # Do these sequentially in the background so two embedding models do not
+        # compete for GPU/VRAM at the same time.
+        await store_memory("conversation", "user", user_text, 0.55)
+        await store_memory("conversation", "assistant", response, 0.45)
+    except Exception as e:
+        print(f"[MEMORY] background save failed: {e}")
+
+
 async def answer(user_text: str):
-    memories = await recall(user_text, top_k=10)
+    memories = await recall(user_text, top_k=6)
     memory_text = "\n".join(
         f"- [{m['kind']}] {m['content']}" for m in memories if m.get("score", 0) > 0.15
     ) or "（関連記憶なし）"
@@ -27,9 +39,11 @@ async def answer(user_text: str):
         },
         {"role": "user", "content": user_text},
     ]
-    response = await chat(messages)
-    await store_memory("conversation", "user", user_text, 0.55)
-    await store_memory("conversation", "assistant", response, 0.45)
+
+    # The user should only wait for recall + one chat generation.
+    # Embedding/saving the new conversation happens after this function returns.
+    response = await chat(messages, num_predict=320)
+    asyncio.create_task(_store_conversation_later(user_text, response))
     return response, memories
 
 
@@ -55,7 +69,7 @@ async def reflect():
     result = await chat([
         {"role": "system", "content": "あなたは第2の脳の内省モジュールです。"},
         {"role": "user", "content": prompt},
-    ], temperature=0.3)
+    ], temperature=0.3, num_predict=180)
     if result.strip() != "NO_REFLECTION":
         await store_memory("reflection", "dmn", result.strip(), 0.75)
     return result.strip()
