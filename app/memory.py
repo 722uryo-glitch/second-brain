@@ -20,53 +20,58 @@ async def store_memory(kind, source, content, importance=0.5, metadata=None):
 
 
 async def recall(query, top_k=8):
-    """Recall memories using semantic similarity plus trust/importance weighting.
+    """Recall only memories that are actually relevant to the current query.
 
-    The main goal is to prevent an old assistant guess from outranking an
-    explicit user/manual memory.
+    Trust/importance bonuses are applied only *after* semantic relevance passes
+    a minimum gate. This prevents a high-trust manual memory from appearing in
+    unrelated small talk just because it has a large source bonus.
     """
     qv = await embed(query)
     scored = []
 
     kind_bonus = {
-        "preference": 0.30,
-        "user_fact": 0.30,
-        "decision": 0.28,
-        "task": 0.24,
-        "note": 0.20,
-        "transcript": 0.10,
-        "reflection": 0.04,
+        "preference": 0.18,
+        "user_fact": 0.18,
+        "decision": 0.16,
+        "task": 0.14,
+        "note": 0.10,
+        "transcript": 0.06,
+        "reflection": 0.02,
         "conversation": 0.00,
     }
 
     source_bonus = {
-        "manual": 0.30,
-        "user": 0.16,
-        "whisper": 0.10,
+        "manual": 0.18,
+        "user": 0.10,
+        "whisper": 0.05,
         "dmn": 0.00,
-        "assistant": -0.24,
+        "assistant": -0.16,
     }
 
     for item in all_memories_with_embeddings():
         similarity = cosine(qv, item["embedding"])
-        importance = float(item.get("importance", 0.5))
         kind = item.get("kind", "conversation")
         source = item.get("source", "")
 
+        # Relevance gate comes FIRST. A trustworthy but unrelated memory must
+        # not leak into the prompt. Assistant text needs an even stronger match.
+        min_similarity = 0.50 if source == "assistant" else 0.40
+        if similarity < min_similarity:
+            continue
+
+        importance = float(item.get("importance", 0.5))
         score = (
-            similarity * 0.68
-            + importance * 0.12
-            + kind_bonus.get(kind, 0.05)
+            similarity * 0.76
+            + importance * 0.08
+            + kind_bonus.get(kind, 0.03)
             + source_bonus.get(source, 0.0)
         )
 
-        # Explicitly saved user knowledge should be hard to displace by
-        # generated assistant text.
-        if source == "manual":
-            score += 0.10
+        # Explicit user knowledge wins among memories that are already relevant.
         if kind in {"preference", "user_fact", "decision"} and source in {"manual", "user"}:
-            score += 0.08
+            score += 0.06
 
+        item["similarity"] = similarity
         item["score"] = score
         scored.append(item)
 
