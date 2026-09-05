@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Second Brain v1</title>
+<style>
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;margin:0;background:#111;color:#eee}.wrap{max-width:1100px;margin:auto;padding:24px}.grid{display:grid;grid-template-columns:2fr 1fr;gap:16px}.card{background:#1b1b1b;border:1px solid #333;border-radius:14px;padding:16px}.chat{height:55vh;overflow:auto;white-space:pre-wrap}.msg{padding:10px 12px;margin:8px 0;border-radius:10px;background:#262626}.me{background:#303640}.row{display:flex;gap:8px;margin-top:10px}input,textarea,button{font:inherit}textarea,input{width:100%;box-sizing:border-box;background:#101010;color:#eee;border:1px solid #444;border-radius:9px;padding:10px}button{background:#eee;color:#111;border:0;border-radius:9px;padding:10px 14px;cursor:pointer}.small{font-size:12px;color:#aaa}.memory{border-bottom:1px solid #333;padding:8px 0}.ok{color:#8fda8f}.bad{color:#ff9797}@media(max-width:800px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body><div class="wrap">
+<h1>Second Brain v1</h1><div id="health" class="small">checking...</div>
+<div class="grid">
+<section class="card"><h2>Chat</h2><div id="chat" class="chat"></div><div class="row"><textarea id="message" rows="3" placeholder="話しかける…"></textarea><button onclick="send()">送信</button></div><div class="row"><button onclick="reflectNow()">今すぐ内省</button><input id="audio" type="file" accept="audio/*" /><button onclick="transcribe()">音声→記憶</button></div></section>
+<aside class="card"><h2>Memory</h2><textarea id="note" rows="3" placeholder="覚えておいてほしいこと"></textarea><div class="row"><button onclick="saveNote()">記憶する</button><button onclick="loadMemories()">更新</button></div><div id="memories"></div></aside>
+</div></div>
+<script>
+const $=id=>document.getElementById(id);function add(text,me=false){const d=document.createElement('div');d.className='msg '+(me?'me':'');d.textContent=text;$('chat').appendChild(d);$('chat').scrollTop=$('chat').scrollHeight}
+async function health(){const r=await fetch('/api/health');const j=await r.json();$('health').innerHTML=j.ok?`<span class="ok">● Ollama接続済み</span> ${j.models.join(', ')}`:`<span class="bad">● Ollama未接続</span> ${j.error||''}`}
+async function send(){const m=$('message').value.trim();if(!m)return;add(m,true);$('message').value='';const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:m})});const j=await r.json();add(j.response||('Error: '+(j.detail||'unknown')));loadMemories()}
+async function saveNote(){const c=$('note').value.trim();if(!c)return;await fetch('/api/memories',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:c,kind:'note',importance:.8})});$('note').value='';loadMemories()}
+async function loadMemories(){const r=await fetch('/api/memories?limit=40');const xs=await r.json();$('memories').innerHTML=xs.map(x=>`<div class="memory"><b>${x.kind}</b> <span class="small">${x.source}</span><div>${esc(x.content)}</div><span class="small">${x.created_at}</span></div>`).join('')}
+async function reflectNow(){add('内省中…');const r=await fetch('/api/reflect',{method:'POST'});const j=await r.json();add('［内省］ '+j.reflection);loadMemories()}
+async function transcribe(){const f=$('audio').files[0];if(!f)return;add('音声を文字起こし中…');const fd=new FormData();fd.append('file',f);const r=await fetch('/api/transcribe',{method:'POST',body:fd});const j=await r.json();add('［文字起こし］ '+(j.text||j.detail));loadMemories()}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]))}
+health();loadMemories();
+</script></body></html>

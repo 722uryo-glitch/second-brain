@@ -1,0 +1,23 @@
+# User-specific / persistent data
+.env
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime / logs
+logs/
+*.log
+tmp/
+temp/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
