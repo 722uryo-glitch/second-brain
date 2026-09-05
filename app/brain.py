@@ -14,13 +14,25 @@ SYSTEM = """あなたはユーザー専用の『第2の脳』です。
 5. assistant の過去発言
 
 原則:
-- manual または user 由来の明示的な記憶は最優先で扱う。
+- 記憶は、現在の発言に直接関係するときだけ使う。
+- 関係のない記憶を、会話に無理やり差し込まない。
+- あいさつや雑談には、関連する記憶がなければ普通に返す。
+- manual または user 由来の明示的な記憶は、関連している場合に最優先で扱う。
 - assistant の過去発言は事実ではなく、過去の生成結果にすぎない。
 - assistant の過去発言と user/manual の記憶が矛盾する場合、user/manual を優先する。
 - 記憶にないことを『覚えている』とは言わない。
 - 明示的な好み・事実・決定事項については勝手に別の答えを推測しない。
-- 返答は簡潔だが、次の行動が明確になるようにする。
+- 返答は自然で簡潔にする。
 """
+
+
+def _is_plain_greeting(text: str) -> bool:
+    t = text.strip().lower().replace("！", "!").replace("？", "?")
+    greetings = {
+        "こんにちは", "こんばんは", "おはよう", "おはようございます",
+        "やあ", "どうも", "hello", "hi", "hey", "こんばんは!", "こんにちは!"
+    }
+    return t in greetings
 
 
 async def _store_conversation_later(user_text: str, response: str):
@@ -34,11 +46,13 @@ async def _store_conversation_later(user_text: str, response: str):
 
 
 async def answer(user_text: str):
-    memories = await recall(user_text, top_k=6)
+    # Plain greetings should not trigger long-term memory retrieval. This avoids
+    # unrelated facts such as preferences leaking into ordinary small talk.
+    memories = [] if _is_plain_greeting(user_text) else await recall(user_text, top_k=6)
+
     memory_text = "\n".join(
         f"- [{m['kind']}/{m['source']}] {m['content']}"
         for m in memories
-        if m.get("score", 0) > 0.15
     ) or "（関連記憶なし）"
 
     messages = [
@@ -46,8 +60,8 @@ async def answer(user_text: str):
         {
             "role": "system",
             "content": (
-                "以下は関連する長期記憶です。上記の信頼順位に従って使ってください。\n"
-                + memory_text
+                "以下は検索で見つかった長期記憶です。現在の発言に直接関係するものだけ使ってください。"
+                "関係が薄いものは完全に無視してください。\n" + memory_text
             ),
         },
         {"role": "user", "content": user_text},
@@ -63,8 +77,6 @@ async def reflect():
     if not recent:
         return "記憶がまだないため、内省をスキップしました。"
 
-    # Keep assistant generations visible for context, but label them clearly so
-    # the reflection module does not promote them to user facts.
     feed = "\n".join(
         f"[{m['kind']}/{m['source']}] {m['content']}" for m in recent
     )
