@@ -20,6 +20,7 @@ from .config import (
 LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
 LLM_RETRY_BASE_SECONDS = float(os.getenv("LLM_RETRY_BASE_SECONDS", "0.7"))
 LLM_MODEL_COOLDOWN_SECONDS = int(os.getenv("LLM_MODEL_COOLDOWN_SECONDS", "90"))
+OLLAMA_INTERACTIVE_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_INTERACTIVE_TIMEOUT_SECONDS", "55"))
 
 _ROUTER_STATS = {
     "uno_success": 0,
@@ -95,7 +96,6 @@ def _mark_model_failure(model, error):
     stats = _model_stats(model)
     stats["failures"] += 1
     stats["last_error"] = str(error)[:220]
-    # Avoid repeatedly paying latency for a model that just failed/rate-limited.
     _MODEL_COOLDOWN_UNTIL[model] = time.monotonic() + max(10, LLM_MODEL_COOLDOWN_SECONDS)
 
 
@@ -133,10 +133,11 @@ async def _ollama_chat(messages, model=None, temperature=0.4, num_predict=384):
     }
     start = time.perf_counter()
     last = None
-    attempts = max(1, LLM_MAX_RETRIES + 1)
+    # Interactive fallback must never turn into a multi-minute retry chain.
+    attempts = 2
     for attempt in range(attempts):
         try:
-            async with httpx.AsyncClient(timeout=180) as client:
+            async with httpx.AsyncClient(timeout=max(15, OLLAMA_INTERACTIVE_TIMEOUT_SECONDS)) as client:
                 r = await client.post(_url("/api/chat"), json=payload)
                 r.raise_for_status()
                 data = r.json()
@@ -151,13 +152,13 @@ async def _ollama_chat(messages, model=None, temperature=0.4, num_predict=384):
             last = e
             if attempt + 1 < attempts and _is_transient(e):
                 _ROUTER_STATS["retries"] += 1
-                await asyncio.sleep(min(3.0, LLM_RETRY_BASE_SECONDS * (2 ** attempt)))
+                await asyncio.sleep(0.5)
                 continue
             break
     raise last or RuntimeError("Ollama chat failed")
 
 
-async def _uno_one(client, headers, model, messages, temperature, num_predict, timeout_seconds):
+async def _uno_one(client, headers, model, messages, temperature, num_predict, timeout_seconds, max_attempts=1):
     payload = {
         "model": model,
         "messages": messages,
@@ -166,7 +167,7 @@ async def _uno_one(client, headers, model, messages, temperature, num_predict, t
         "max_tokens": num_predict,
     }
     last = None
-    attempts = max(1, LLM_MAX_RETRIES + 1)
+    attempts = max(1, int(max_attempts))
     for attempt in range(attempts):
         start = time.perf_counter()
         try:
@@ -183,7 +184,7 @@ async def _uno_one(client, headers, model, messages, temperature, num_predict, t
             last = e
             if attempt + 1 < attempts and _is_transient(e):
                 _ROUTER_STATS["retries"] += 1
-                await asyncio.sleep(min(3.0, LLM_RETRY_BASE_SECONDS * (2 ** attempt)))
+                await asyncio.sleep(min(1.0, LLM_RETRY_BASE_SECONDS * (2 ** attempt)))
                 continue
             break
     _mark_model_failure(model, last)
@@ -197,19 +198,23 @@ async def _uno_chat(messages, models, temperature=0.4, num_predict=384, route="c
     headers = {"Authorization": f"Bearer {UNOROUTER_API_KEY}", "Content-Type": "application/json"}
     if route == "fast_cloud":
         model_list = _fast_model_order(models)
-        per_model_timeout = min(24, max(8, UNOROUTER_TIMEOUT_SECONDS))
+        per_model_timeout = min(16, max(7, UNOROUTER_TIMEOUT_SECONDS))
         max_models = 2
+        max_attempts = 1
     elif route in {"verify", "reasoning"}:
         model_list = _reasoning_model_order(models)
-        per_model_timeout = min(70, max(15, UNOROUTER_TIMEOUT_SECONDS))
-        max_models = 3
+        # Reasoning used to allow 3 models x retries x 70s, which could make a
+        # single browser request appear frozen for several minutes.
+        per_model_timeout = min(28, max(12, UNOROUTER_TIMEOUT_SECONDS))
+        max_models = 2
+        max_attempts = 1
     else:
         model_list = list(dict.fromkeys(models))
-        per_model_timeout = min(60, max(12, UNOROUTER_TIMEOUT_SECONDS))
-        max_models = 3
+        per_model_timeout = min(24, max(10, UNOROUTER_TIMEOUT_SECONDS))
+        max_models = 2
+        max_attempts = 1
 
     available = [m for m in model_list if _model_available(m)]
-    # If every model is in cooldown, allow one probe instead of guaranteeing local forever.
     if not available and model_list:
         available = model_list[:1]
 
@@ -218,7 +223,8 @@ async def _uno_chat(messages, models, temperature=0.4, num_predict=384, route="c
         for model in available[:max_models]:
             try:
                 content, latency = await _uno_one(
-                    client, headers, model, messages, temperature, num_predict, per_model_timeout
+                    client, headers, model, messages, temperature, num_predict,
+                    per_model_timeout, max_attempts=max_attempts,
                 )
                 _ROUTER_STATS["uno_success"] += 1
                 _ROUTER_STATS["last_provider"] = "unorouter"
@@ -237,15 +243,7 @@ async def _uno_chat(messages, models, temperature=0.4, num_predict=384, route="c
 
 
 async def chat(messages, model=None, temperature=0.4, num_predict=384, route="auto"):
-    """Role-aware model routing with retries, cooldown and local fallback.
-
-    fast_cloud -> latency-sensitive planner/simple work
-    reasoning  -> complex synthesis / long research deliverables
-    verify     -> evidence-gap analysis, fact-checking, critic
-    cloud      -> normal cloud lane
-    local      -> privacy-sensitive/local-only work
-    auto       -> public intelligence to verify models, otherwise policy default
-    """
+    """Role-aware routing with bounded latency and local fallback."""
     public_intelligence = _looks_like_public_intelligence(messages)
     _ROUTER_STATS["last_route"] = route
     cloud_allowed = (
@@ -288,17 +286,17 @@ def router_status():
         "verify_reasoning_models": list(UNOROUTER_VERIFY_MODELS),
         "cooldowns_seconds": cooldowns,
         "stats": dict(_ROUTER_STATS),
-        "policy": "fast planner/chat -> chat models; complex reasoning/verification -> verify models; personal memory work stays local unless enabled; failures retry then fallback local",
+        "policy": "interactive routes are latency-bounded; fast -> chat models; reasoning/verify -> verify models; failures fall back locally",
     }
 
 
 async def embed(text: str, model=None):
     payload = {"model": model or OLLAMA_EMBED_MODEL, "input": text, "keep_alive": "30m"}
     last = None
-    attempts = max(1, LLM_MAX_RETRIES + 1)
+    attempts = max(1, min(2, LLM_MAX_RETRIES + 1))
     for attempt in range(attempts):
         try:
-            async with httpx.AsyncClient(timeout=120) as client:
+            async with httpx.AsyncClient(timeout=45) as client:
                 r = await client.post(_url("/api/embed"), json=payload)
                 r.raise_for_status()
                 data = r.json()
@@ -310,7 +308,7 @@ async def embed(text: str, model=None):
             last = e
             if attempt + 1 < attempts and _is_transient(e):
                 _ROUTER_STATS["retries"] += 1
-                await asyncio.sleep(min(2.5, LLM_RETRY_BASE_SECONDS * (2 ** attempt)))
+                await asyncio.sleep(0.5)
                 continue
             break
     raise last or RuntimeError("embedding failed")
