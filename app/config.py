@@ -13,7 +13,6 @@ OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
 UNOROUTER_ENABLED = os.getenv("UNOROUTER_ENABLED", "true").lower() == "true"
 UNOROUTER_BASE_URL = os.getenv("UNOROUTER_BASE_URL", "https://api.unorouter.com/v1")
 UNOROUTER_API_KEY = os.getenv("UNOROUTER_API_KEY", "").strip()
-# False by default because normal chat can include recalled personal memories.
 UNOROUTER_PRIVATE_CHAT = os.getenv("UNOROUTER_PRIVATE_CHAT", "false").lower() == "true"
 UNOROUTER_TIMEOUT_SECONDS = int(os.getenv("UNOROUTER_TIMEOUT_SECONDS", "120"))
 UNOROUTER_CHAT_MODELS = _csv_env(
@@ -24,6 +23,15 @@ UNOROUTER_VERIFY_MODELS = _csv_env(
     "UNOROUTER_VERIFY_MODELS",
     "glm-5.3-flash-think-search:free,glm-5.3-flash-thinking:free,qwen3.8-flash-next:free",
 )
+
+# Executive layer: planner -> retrieval/research -> draft -> critic -> optional revision.
+EXECUTIVE_ENABLED = os.getenv("EXECUTIVE_ENABLED", "true").lower() == "true"
+EXECUTIVE_REVIEW_ENABLED = os.getenv("EXECUTIVE_REVIEW_ENABLED", "true").lower() == "true"
+EXECUTIVE_MAX_RESEARCH_QUERIES = int(os.getenv("EXECUTIVE_MAX_RESEARCH_QUERIES", "3"))
+EXECUTIVE_MAX_REVISIONS = int(os.getenv("EXECUTIVE_MAX_REVISIONS", "1"))
+EXECUTIVE_HISTORY_TURNS = int(os.getenv("EXECUTIVE_HISTORY_TURNS", "8"))
+EXECUTIVE_SIMPLE_MAX_TOKENS = int(os.getenv("EXECUTIVE_SIMPLE_MAX_TOKENS", "520"))
+EXECUTIVE_LONG_MAX_TOKENS = int(os.getenv("EXECUTIVE_LONG_MAX_TOKENS", "2200"))
 
 DB_PATH = os.getenv("SECOND_BRAIN_DB", "second_brain.db")
 DMN_INTERVAL_MINUTES = int(os.getenv("DMN_INTERVAL_MINUTES", "30"))
