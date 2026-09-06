@@ -18,6 +18,9 @@ from .brain import answer, reflect
 from .memory import store_memory
 from .ollama_client import health, router_status
 from .executive import status as executive_status
+from .retrieval import init_search_index, retrieval_status
+from .runtime_state import init_runtime_state, runtime_state_status
+from .orchestrator import orchestrator_status
 from .whisper_service import transcribe_bytes
 from .global_intelligence import (
     collect_global_information,
@@ -70,6 +73,12 @@ async def document_fetch_loop():
 async def lifespan(app: FastAPI):
     init_db()
     init_v1_storage()
+    init_runtime_state()
+    try:
+        init_search_index()
+    except Exception as e:
+        print(f"[RETRIEVAL] FTS initialization failed; LIKE fallback remains available: {e}")
+
     tasks = []
     if DMN_ENABLED:
         tasks.append(asyncio.create_task(dmn_loop()))
@@ -86,7 +95,7 @@ async def lifespan(app: FastAPI):
         task.cancel()
 
 
-app = FastAPI(title="Second Brain V1 Executive Intelligence", lifespan=lifespan)
+app = FastAPI(title="Second Brain V2 Executive Intelligence", lifespan=lifespan)
 STATIC = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
@@ -112,11 +121,14 @@ async def api_health():
         tags = await health()
         return {
             "ok": True,
-            "version": "V1-executive",
+            "version": "V2-executive-research",
             "ollama": True,
             "models": [m.get("name") for m in tags.get("models", [])],
             "ai_router": router_status(),
             "executive": executive_status(),
+            "retrieval": retrieval_status(),
+            "runtime_state": runtime_state_status(),
+            "research": orchestrator_status(),
             "external_collection": EXTERNAL_COLLECTION_ENABLED,
             "external_collection_interval_minutes": EXTERNAL_COLLECTION_INTERVAL_MINUTES,
             "document_fetch": DOCUMENT_FETCH_ENABLED,
@@ -144,6 +156,15 @@ async def api_executive_status():
 @app.get("/api/executive/runs")
 async def api_executive_runs(limit: int = 20, steps: bool = False):
     return recent_agent_runs(min(max(limit, 1), 100), include_steps=steps)
+
+
+@app.get("/api/research/status")
+async def api_research_status():
+    return {
+        "orchestrator": orchestrator_status(),
+        "retrieval": retrieval_status(),
+        "runtime_state": runtime_state_status(),
+    }
 
 
 @app.post("/api/chat")
