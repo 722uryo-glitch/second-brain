@@ -57,6 +57,12 @@ _DELEGATION_MARKERS = (
     "考えて", "作って", "書いて", "実行して", "進めて",
 )
 
+_STRONG_RESEARCH_CLAIM_MARKERS = (
+    "需要が", "需要は", "供給が少", "供給不足", "競合が少", "競合は少", "未開拓", "市場規模",
+    "不足率", "成長率", "シェア", "最も", "圧倒的", "確実に", "確実な", "急増", "急拡大",
+    "demand", "low competition", "undersupplied", "market size", "growth rate",
+)
+
 
 def _now_ms():
     return int(time.perf_counter() * 1000)
@@ -236,11 +242,7 @@ def _renumber_pack(pack: dict, start_no: int):
 
     context = str(pack.get("context") or "")
     if mapping:
-        context = re.sub(
-            r"\[(S\d+)\]",
-            lambda m: f"[{mapping.get(m.group(1), m.group(1))}]",
-            context,
-        )
+        context = re.sub(r"\[(S\d+)\]", lambda m: f"[{mapping.get(m.group(1), m.group(1))}]", context)
     return {**pack, "context": context, "refs": new_refs}, next_no
 
 
@@ -290,7 +292,7 @@ def _research_context(packs: list):
 
 def _answer_system(plan: dict, research_enough: bool, personal: bool):
     evidence_rule = (
-        "Research evidence is sufficient enough to synthesize, but still distinguish facts from inference."
+        "Research evidence is sufficient enough to synthesize, but every researched factual or market claim still requires an inline [S#] citation."
         if research_enough else
         "Research evidence is incomplete. Explicitly label unsupported conclusions as hypotheses and never invent demand, supply, competition, prices, statistics, or current facts."
     )
@@ -303,8 +305,8 @@ def _answer_system(plan: dict, research_enough: bool, personal: bool):
         "You are the execution layer of a persistent Second Brain. Your job is to finish the user's task, not merely discuss it. "
         "Follow the execution plan, use the supplied memory/research before general knowledge, and do not ask questions already answered in recent dialogue. "
         "If the user delegated a choice, choose the strongest option and continue. "
-        "For factual claims grounded in supplied research, cite source markers such as [S1] inline where available. "
-        "Do not claim that something was researched unless the supplied evidence supports it. "
+        "Every concrete number, percentage, date-sensitive fact, market-size statement, demand claim, low-competition claim, and supply-gap claim derived from research MUST have an inline source marker [S#] in the same sentence or immediately after it. "
+        "Never convert a weak inference into a fact. If the evidence cannot prove low competition or low supply, say that explicitly. "
         f"{evidence_rule} {privacy} "
         "Return a complete, coherent answer in the user's language. For long-form work, do not stop mid-section or mid-sentence."
     )
@@ -320,13 +322,41 @@ async def _draft(user_text: str, history: list, plan: dict, memories: list, rese
         *history,
         {"role": "user", "content": user_text},
     ]
-
     route = "local" if personal and not UNOROUTER_PRIVATE_CHAT else "fast_cloud"
     tokens = EXECUTIVE_LONG_MAX_TOKENS if plan.get("long_form") else EXECUTIVE_SIMPLE_MAX_TOKENS
-    return await chat(messages, temperature=0.22, num_predict=tokens, route=route)
+    return await chat(messages, temperature=0.18, num_predict=tokens, route=route)
 
 
-async def _critique(user_text: str, plan: dict, draft: str, research_packs: list, research_enough: bool):
+def _deterministic_research_audit(draft: str, refs: list, needs_research: bool):
+    if not needs_research:
+        return []
+    valid = {str(r.get("ref")) for r in refs if r.get("ref")}
+    issues = []
+    cited = set(re.findall(r"\[(S\d+)\]", draft or ""))
+    if refs and not (cited & valid):
+        issues.append("research_answer_has_no_valid_inline_citations")
+
+    for raw in re.split(r"(?<=[。！？!?\n])", draft or ""):
+        sentence = raw.strip()
+        if not sentence:
+            continue
+        has_number = bool(re.search(r"\d(?:[\d,.]*\d)?\s*(?:%|％|万人|億円|兆円|人|件|年|倍)", sentence))
+        strong_claim = any(marker.lower() in sentence.lower() for marker in _STRONG_RESEARCH_CLAIM_MARKERS)
+        if not (has_number or strong_claim):
+            continue
+        markers = set(re.findall(r"\[(S\d+)\]", sentence))
+        if not (markers & valid):
+            issues.append("uncited_material_claim: " + sentence[:180])
+        if len(issues) >= 8:
+            break
+    return issues
+
+
+async def _critique(user_text: str, plan: dict, draft: str, research_packs: list, research_enough: bool, refs: list):
+    deterministic = _deterministic_research_audit(draft, refs, bool(plan.get("needs_research")))
+    if deterministic:
+        return {"pass": False, "issues": deterministic, "missing": [], "confidence": 1.0, "deterministic": True}
+
     if not EXECUTIVE_REVIEW_ENABLED or plan.get("complexity") != "complex":
         return {"pass": True, "issues": [], "missing": [], "confidence": 1.0, "skipped": True}
 
@@ -352,6 +382,7 @@ Fail the draft if any of these occur:
 - it ignores an explicit part of the request;
 - it asks an unnecessary clarification after the user delegated choices;
 - it presents unsupported demand/supply/competition/current-fact claims as proven;
+- it gives a concrete statistic or percentage without a matching source marker;
 - it contradicts itself;
 - it stops before completing the requested deliverable;
 - it claims to have researched evidence that is not in the evidence pack.
@@ -360,20 +391,20 @@ Do not fail merely for style preferences.
     try:
         raw = await chat(
             [
-                {"role": "system", "content": "You are a strict answer auditor. JSON only."},
+                {"role": "system", "content": "You are a strict answer auditor. JSON only. When uncertain, fail closed."},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.0,
-            num_predict=380,
+            num_predict=420,
             route="cloud",
         )
         result = _extract_json_object(raw)
     except Exception as e:
         print(f"[EXECUTIVE] critic failed: {e}")
-        return {"pass": True, "issues": ["critic_unavailable"], "missing": [], "confidence": 0.0}
+        return {"pass": False, "issues": ["critic_unavailable"], "missing": [], "confidence": 0.0}
 
     if not result:
-        return {"pass": True, "issues": ["critic_parse_failed"], "missing": [], "confidence": 0.0}
+        return {"pass": False, "issues": ["critic_parse_failed"], "missing": [], "confidence": 0.0}
     result["pass"] = bool(result.get("pass", False))
     result["issues"] = [str(x)[:400] for x in result.get("issues", [])][:8]
     result["missing"] = [str(x)[:400] for x in result.get("missing", [])][:8]
@@ -402,7 +433,8 @@ Original draft:
 
 Rules:
 - Fix every substantive critique issue.
-- Do not invent evidence.
+- Remove any number, percentage, market-size, demand, supply-gap, or low-competition claim that cannot be cited from the supplied research.
+- Every retained material research claim must carry an inline [S#] citation.
 - If research is insufficient, label uncertain conclusions as hypotheses instead of pretending certainty.
 - Complete the deliverable in this response.
 - Answer in the user's language.
@@ -415,7 +447,7 @@ Rules:
     ]
     route = "local" if personal and not UNOROUTER_PRIVATE_CHAT else "fast_cloud"
     tokens = EXECUTIVE_LONG_MAX_TOKENS if plan.get("long_form") else EXECUTIVE_SIMPLE_MAX_TOKENS
-    return await chat(messages, temperature=0.12, num_predict=tokens, route=route)
+    return await chat(messages, temperature=0.08, num_predict=tokens, route=route)
 
 
 def _append_sources(response: str, refs: list):
@@ -439,6 +471,17 @@ def _append_sources(response: str, refs: list):
     return response if not lines else response + "\n\n参照した情報源:\n" + "\n".join(lines)
 
 
+def _safe_research_failure(user_text: str, critique: dict):
+    issues = critique.get("issues") or []
+    detail = " / ".join(str(x)[:140] for x in issues[:3])
+    return (
+        "第2の脳で調査・生成・監査まで実行しましたが、根拠監査を通過できなかったため、記事をそのまま出すのを止めました。\n\n"
+        "現時点では、需要・供給不足・競合の少なさ・市場規模などを同時に裏付ける証拠が足りないか、生成文に出典のない断定が残っています。"
+        "ここでそれっぽい数字や『未開拓』『競合が少ない』を作るより、未証明として止めるのが正しい挙動です。"
+        + (f"\n\n監査で残った問題: {detail}" if detail else "")
+    )
+
+
 async def _store_conversation_later(user_text: str, response: str, run_id=None):
     try:
         metadata = {"agent_run_id": run_id} if run_id else None
@@ -454,23 +497,14 @@ async def _store_conversation_later(user_text: str, response: str, run_id=None):
 
 async def run(user_text: str):
     if not EXECUTIVE_ENABLED:
-        response = await chat(
-            [{"role": "user", "content": user_text}],
-            temperature=0.25,
-            num_predict=EXECUTIVE_SIMPLE_MAX_TOKENS,
-            route="fast_cloud",
-        )
+        response = await chat([{"role": "user", "content": user_text}], temperature=0.25, num_predict=EXECUTIVE_SIMPLE_MAX_TOKENS, route="fast_cloud")
         asyncio.create_task(_store_conversation_later(user_text, response))
         return ExecutiveResult(response, [], None, "disabled", {}, {})
 
     history = _history()
     if _is_greeting(user_text):
         response = await chat(
-            [
-                {"role": "system", "content": "Reply naturally and briefly in the user's language."},
-                *history[-4:],
-                {"role": "user", "content": user_text},
-            ],
+            [{"role": "system", "content": "Reply naturally and briefly in the user's language."}, *history[-4:], {"role": "user", "content": user_text}],
             num_predict=100,
             route="local",
         )
@@ -482,83 +516,50 @@ async def run(user_text: str):
     mode = plan.get("mode", "work")
     run_id = start_agent_run(user_text, plan.get("goal", ""), mode, plan)
     step_no = 1
-    add_agent_step(
-        run_id, step_no, "plan", "Create execution plan", output_data=plan,
-        duration_ms=_elapsed_ms(plan_start),
-    )
+    add_agent_step(run_id, step_no, "plan", "Create execution plan", output_data=plan, duration_ms=_elapsed_ms(plan_start))
     step_no += 1
 
     try:
         memory_start = _now_ms()
         memories = await _gather_memory(user_text, bool(plan.get("needs_memory")))
-        add_agent_step(
-            run_id, step_no, "memory", "Retrieve relevant long-term memory",
-            output_data={"count": len(memories), "ids": [m.get("id") for m in memories[:8]]},
-            duration_ms=_elapsed_ms(memory_start),
-        )
+        add_agent_step(run_id, step_no, "memory", "Retrieve relevant long-term memory", output_data={"count": len(memories), "ids": [m.get("id") for m in memories[:8]]}, duration_ms=_elapsed_ms(memory_start))
         step_no += 1
 
         research_start = _now_ms()
         research_packs, refs, research_enough = await _gather_research(plan, user_text)
-        add_agent_step(
-            run_id, step_no, "research", "Retrieve and research external evidence",
-            input_data={"queries": plan.get("subquestions", [])},
-            output_data={
-                "packs": len(research_packs),
-                "references": len(refs),
-                "sufficient": research_enough,
-            },
-            duration_ms=_elapsed_ms(research_start),
-        )
+        add_agent_step(run_id, step_no, "research", "Retrieve and research external evidence", input_data={"queries": plan.get("subquestions", [])}, output_data={"packs": len(research_packs), "references": len(refs), "sufficient": research_enough}, duration_ms=_elapsed_ms(research_start))
         step_no += 1
 
         draft_start = _now_ms()
         response = await _draft(user_text, history, plan, memories, research_packs, research_enough)
-        add_agent_step(
-            run_id, step_no, "draft", "Produce answer or deliverable",
-            output_data={"characters": len(response)},
-            duration_ms=_elapsed_ms(draft_start),
-        )
+        add_agent_step(run_id, step_no, "draft", "Produce answer or deliverable", output_data={"characters": len(response)}, duration_ms=_elapsed_ms(draft_start))
         step_no += 1
 
         review_start = _now_ms()
-        critique = await _critique(user_text, plan, response, research_packs, research_enough)
-        add_agent_step(
-            run_id, step_no, "review", "Audit answer against goal and evidence",
-            output_data=critique,
-            duration_ms=_elapsed_ms(review_start),
-        )
+        critique = await _critique(user_text, plan, response, research_packs, research_enough, refs)
+        add_agent_step(run_id, step_no, "review", "Audit answer against goal and evidence", output_data=critique, duration_ms=_elapsed_ms(review_start))
         step_no += 1
 
         revisions = 0
         while not critique.get("pass", True) and revisions < max(0, EXECUTIVE_MAX_REVISIONS):
             revise_start = _now_ms()
-            response = await _revise(
-                user_text, plan, response, critique, memories, research_packs, research_enough
-            )
+            response = await _revise(user_text, plan, response, critique, memories, research_packs, research_enough)
             revisions += 1
-            add_agent_step(
-                run_id, step_no, "revise", "Revise failed draft",
-                input_data={"issues": critique.get("issues", []), "missing": critique.get("missing", [])},
-                output_data={"characters": len(response), "revision": revisions},
-                duration_ms=_elapsed_ms(revise_start),
-            )
+            add_agent_step(run_id, step_no, "revise", "Revise failed draft", input_data={"issues": critique.get("issues", []), "missing": critique.get("missing", [])}, output_data={"characters": len(response), "revision": revisions}, duration_ms=_elapsed_ms(revise_start))
             step_no += 1
-            if revisions < EXECUTIVE_MAX_REVISIONS:
-                critique = await _critique(user_text, plan, response, research_packs, research_enough)
+            critique = await _critique(user_text, plan, response, research_packs, research_enough, refs)
 
-        response = _append_sources(response, refs)
+        if plan.get("needs_research") and not critique.get("pass", False):
+            response = _safe_research_failure(user_text, critique)
+        else:
+            response = _append_sources(response, refs)
+
         finish_agent_run(
             run_id,
             "completed",
             final_response=response,
             critique=critique,
-            metadata={
-                "research_sufficient": research_enough,
-                "references": len(refs),
-                "revisions": revisions,
-                "memory_count": len(memories),
-            },
+            metadata={"research_sufficient": research_enough, "references": len(refs), "revisions": revisions, "memory_count": len(memories)},
         )
         asyncio.create_task(_store_conversation_later(user_text, response, run_id))
         return ExecutiveResult(response, memories, run_id, mode, plan, critique)
