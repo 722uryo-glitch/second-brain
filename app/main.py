@@ -6,10 +6,18 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .db import init_db, recent_memories, delete_memory, recent_external_items, recent_claims
+from .db import (
+    init_db,
+    recent_memories,
+    delete_memory,
+    recent_external_items,
+    recent_claims,
+    recent_agent_runs,
+)
 from .brain import answer, reflect
 from .memory import store_memory
 from .ollama_client import health, router_status
+from .executive import status as executive_status
 from .whisper_service import transcribe_bytes
 from .global_intelligence import (
     collect_global_information,
@@ -45,7 +53,6 @@ async def dmn_loop():
 
 
 async def document_fetch_loop():
-    """Continuously drain full-text fetch work instead of only fetching once per collection run."""
     while True:
         try:
             result = await fetch_document_bodies()
@@ -79,7 +86,7 @@ async def lifespan(app: FastAPI):
         task.cancel()
 
 
-app = FastAPI(title="Second Brain V1 Intelligence", lifespan=lifespan)
+app = FastAPI(title="Second Brain V1 Executive Intelligence", lifespan=lifespan)
 STATIC = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
@@ -105,10 +112,11 @@ async def api_health():
         tags = await health()
         return {
             "ok": True,
-            "version": "V1",
+            "version": "V1-executive",
             "ollama": True,
             "models": [m.get("name") for m in tags.get("models", [])],
             "ai_router": router_status(),
+            "executive": executive_status(),
             "external_collection": EXTERNAL_COLLECTION_ENABLED,
             "external_collection_interval_minutes": EXTERNAL_COLLECTION_INTERVAL_MINUTES,
             "document_fetch": DOCUMENT_FETCH_ENABLED,
@@ -128,16 +136,28 @@ async def api_ai_router_status():
     return router_status()
 
 
+@app.get("/api/executive/status")
+async def api_executive_status():
+    return executive_status()
+
+
+@app.get("/api/executive/runs")
+async def api_executive_runs(limit: int = 20, steps: bool = False):
+    return recent_agent_runs(min(max(limit, 1), 100), include_steps=steps)
+
+
 @app.post("/api/chat")
 async def api_chat(data: ChatIn):
     try:
         response, memories = await answer(data.message)
+        latest = recent_agent_runs(1, include_steps=False)
         return {
             "response": response,
             "recalled": [
                 {"id": m["id"], "kind": m["kind"], "content": m["content"], "score": round(m["score"], 3)}
                 for m in memories[:6]
             ],
+            "agent_run_id": latest[0]["id"] if latest else None,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
