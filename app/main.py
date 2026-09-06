@@ -6,12 +6,18 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .db import init_db, recent_memories, delete_memory
+from .db import init_db, recent_memories, delete_memory, recent_external_items
 from .brain import answer, reflect
 from .memory import store_memory
 from .ollama_client import health
 from .whisper_service import transcribe_bytes
-from .config import DMN_ENABLED, DMN_INTERVAL_MINUTES
+from .external_collector import collect_external_information, external_collection_loop
+from .config import (
+    DMN_ENABLED,
+    DMN_INTERVAL_MINUTES,
+    EXTERNAL_COLLECTION_ENABLED,
+    EXTERNAL_COLLECTION_INTERVAL_MINUTES,
+)
 
 
 async def dmn_loop():
@@ -26,11 +32,17 @@ async def dmn_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    task = None
+    tasks = []
     if DMN_ENABLED:
-        task = asyncio.create_task(dmn_loop())
+        tasks.append(asyncio.create_task(dmn_loop()))
+    if EXTERNAL_COLLECTION_ENABLED:
+        tasks.append(
+            asyncio.create_task(
+                external_collection_loop(EXTERNAL_COLLECTION_INTERVAL_MINUTES)
+            )
+        )
     yield
-    if task:
+    for task in tasks:
         task.cancel()
 
 
@@ -58,7 +70,13 @@ async def home():
 async def api_health():
     try:
         tags = await health()
-        return {"ok": True, "ollama": True, "models": [m.get("name") for m in tags.get("models", [])]}
+        return {
+            "ok": True,
+            "ollama": True,
+            "models": [m.get("name") for m in tags.get("models", [])],
+            "external_collection": EXTERNAL_COLLECTION_ENABLED,
+            "external_collection_interval_minutes": EXTERNAL_COLLECTION_INTERVAL_MINUTES,
+        }
     except Exception as e:
         return {"ok": False, "ollama": False, "error": str(e)}
 
@@ -98,6 +116,16 @@ async def api_delete_memory(memory_id: int):
 @app.post("/api/reflect")
 async def api_reflect():
     return {"reflection": await reflect()}
+
+
+@app.post("/api/collect")
+async def api_collect():
+    return await collect_external_information()
+
+
+@app.get("/api/external/latest")
+async def api_external_latest(limit: int = 100):
+    return recent_external_items(min(max(limit, 1), 500))
 
 
 @app.post("/api/transcribe")
