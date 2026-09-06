@@ -14,7 +14,7 @@ from .db import (
     recent_claims,
     recent_agent_runs,
 )
-from .brain import answer, reflect
+from .brain import answer_detailed, reflect
 from .memory import store_memory
 from .ollama_client import health, router_status
 from .executive import status as executive_status
@@ -170,15 +170,17 @@ async def api_research_status():
 @app.post("/api/chat")
 async def api_chat(data: ChatIn):
     try:
-        response, memories = await answer(data.message)
-        latest = recent_agent_runs(1, include_steps=False)
+        result = await answer_detailed(data.message)
         return {
-            "response": response,
+            "response": result.response,
             "recalled": [
                 {"id": m["id"], "kind": m["kind"], "content": m["content"], "score": round(m["score"], 3)}
-                for m in memories[:6]
+                for m in result.memories[:6]
             ],
-            "agent_run_id": latest[0]["id"] if latest else None,
+            "agent_run_id": result.run_id,
+            "mode": result.mode,
+            "plan": result.plan,
+            "critique": result.critique,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
