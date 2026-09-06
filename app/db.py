@@ -99,6 +99,25 @@ def recent_memories(limit=30):
     return [dict(r) for r in rows]
 
 
+def recent_conversation(limit=10):
+    """Return recent user/assistant conversation turns in chronological order.
+
+    This is deliberately separate from semantic long-term recall: normal dialogue
+    continuity should not depend on embedding similarity.
+    """
+    with _lock, _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id,created_at,source,content
+            FROM memories
+            WHERE kind='conversation' AND source IN ('user','assistant')
+            ORDER BY id DESC LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
 def all_memories_with_embeddings(limit=2000):
     with _lock, _connect() as conn:
         rows = conn.execute("SELECT * FROM memories WHERE embedding_json IS NOT NULL ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
@@ -153,11 +172,6 @@ def _clean_search_terms(terms, max_terms=10):
 
 
 def search_external_items(terms, limit=30):
-    """Search recent collected intelligence by several multilingual/English terms.
-
-    This intentionally uses simple LIKE queries rather than requiring an FTS migration,
-    so existing user databases become searchable immediately after updating.
-    """
     terms = _clean_search_terms(terms)
     if not terms:
         return []
