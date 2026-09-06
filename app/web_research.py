@@ -1,7 +1,6 @@
 import asyncio
 import os
 import re
-import time
 from datetime import datetime, timezone
 from urllib.parse import quote, urlparse, urlunparse
 
@@ -51,8 +50,6 @@ def _canonical_url(url: str):
         p = urlparse(url)
         if not p.scheme or not p.netloc:
             return url
-        # Drop fragments and common tracking parameters by discarding query only
-        # when it is clearly tracking-heavy. Preserve functional queries.
         query = p.query
         if query and any(x in query.lower() for x in ("utm_", "gclid=", "fbclid=")):
             kept = []
@@ -205,6 +202,7 @@ async def fetch_result_body(item: dict):
         if "html" in ctype or not ctype:
             body = _extract_main_text(r.text, str(r.url))[:14000]
         copied = dict(item)
+        copied["original_url"] = url
         copied["final_url"] = str(r.url)
         copied["url"] = _canonical_url(str(r.url))
         copied["domain"] = _domain(copied["url"])
@@ -213,6 +211,7 @@ async def fetch_result_body(item: dict):
     except Exception as e:
         _STATS["page_fetch_failures"] += 1
         copied = dict(item)
+        copied["original_url"] = url
         copied["fetch_error"] = str(e)[:180]
         return copied
 
@@ -269,12 +268,7 @@ def _persist(rows, query):
 
 
 async def research_web(query: str, current=False, limit=None):
-    """Search the general web and news, then fetch top pages for evidence.
-
-    SearXNG is the preferred general-web layer because it is local, private and
-    metasearch-capable. Google News remains a no-key fallback/supplement for
-    current-affairs coverage.
-    """
+    """Search general web + news and fetch the top direct pages for evidence."""
     limit = int(limit or RESEARCH_WEB_LIMIT)
     time_range = "month" if current else None
     general_task = asyncio.create_task(searxng_search(query, limit=limit, time_range=time_range))
@@ -282,15 +276,13 @@ async def research_web(query: str, current=False, limit=None):
     general, news = await asyncio.gather(general_task, news_task)
 
     rows = _dedupe(general + news)
-    # Prioritize direct web results for body extraction; news redirect pages are
-    # less useful as independent evidence until resolved.
     fetch_candidates = [r for r in rows if r.get("provider") == "searxng"][:max(0, RESEARCH_FETCH_TOP_K)]
     if fetch_candidates:
         fetched = await asyncio.gather(*(fetch_result_body(r) for r in fetch_candidates))
-        by_url = {r.get("url"): r for r in fetched}
+        by_original = {(r.get("original_url") or r.get("url")): r for r in fetched}
         merged = []
         for row in rows:
-            merged.append(by_url.get(row.get("url"), row))
+            merged.append(by_original.get(row.get("url"), row))
         rows = _dedupe(merged)
 
     rows = rows[:limit]
