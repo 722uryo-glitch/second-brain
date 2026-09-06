@@ -24,14 +24,14 @@ UNOROUTER_VERIFY_MODELS = _csv_env(
     "glm-5.3-flash-think-search:free,glm-5.3-flash-thinking:free,qwen3.8-flash-next:free",
 )
 
-# Executive layer: planner -> retrieval/research -> draft -> critic -> optional revision.
+# Executive layer: planner -> retrieval/research -> draft -> critic -> revision.
 EXECUTIVE_ENABLED = os.getenv("EXECUTIVE_ENABLED", "true").lower() == "true"
 EXECUTIVE_REVIEW_ENABLED = os.getenv("EXECUTIVE_REVIEW_ENABLED", "true").lower() == "true"
 EXECUTIVE_MAX_RESEARCH_QUERIES = int(os.getenv("EXECUTIVE_MAX_RESEARCH_QUERIES", "3"))
-EXECUTIVE_MAX_REVISIONS = int(os.getenv("EXECUTIVE_MAX_REVISIONS", "1"))
-EXECUTIVE_HISTORY_TURNS = int(os.getenv("EXECUTIVE_HISTORY_TURNS", "8"))
-EXECUTIVE_SIMPLE_MAX_TOKENS = int(os.getenv("EXECUTIVE_SIMPLE_MAX_TOKENS", "520"))
-EXECUTIVE_LONG_MAX_TOKENS = int(os.getenv("EXECUTIVE_LONG_MAX_TOKENS", "2200"))
+EXECUTIVE_MAX_REVISIONS = int(os.getenv("EXECUTIVE_MAX_REVISIONS", "2"))
+EXECUTIVE_HISTORY_TURNS = int(os.getenv("EXECUTIVE_HISTORY_TURNS", "10"))
+EXECUTIVE_SIMPLE_MAX_TOKENS = int(os.getenv("EXECUTIVE_SIMPLE_MAX_TOKENS", "650"))
+EXECUTIVE_LONG_MAX_TOKENS = int(os.getenv("EXECUTIVE_LONG_MAX_TOKENS", "2600"))
 
 DB_PATH = os.getenv("SECOND_BRAIN_DB", "second_brain.db")
 DMN_INTERVAL_MINUTES = int(os.getenv("DMN_INTERVAL_MINUTES", "30"))
