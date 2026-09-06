@@ -51,6 +51,11 @@ _PERSONAL_MARKERS = (
     "私の", "僕の", "俺の", "自分の", "覚えて", "前に話", "前回", "好み", "予定", "タスク",
     "住所", "電話", "メール", "家族", "友達", "学校", "職場", "仕事の", "名前", "誕生日",
 )
+_LONG_FORM_MARKERS = (
+    "記事を書", "記事作成", "ブログを書", "レポートを書", "論文を書", "台本を書", "原稿を書",
+    "企画書", "提案書", "完全版", "詳しくまとめ", "詳細にまとめ", "長文", "徹底的に",
+    "article", "blog post", "write an article", "report", "full draft", "long-form",
+)
 _ALIASES = {
     "アメリカ": ["アメリカ", "米国", "United States", "US"],
     "米国": ["米国", "アメリカ", "United States", "US"],
@@ -89,6 +94,11 @@ def _is_current_public_question(text: str) -> bool:
 def _looks_personal(text: str) -> bool:
     t = text.lower()
     return any(x.lower() in t for x in _PERSONAL_MARKERS)
+
+
+def _is_long_form_task(text: str) -> bool:
+    t = text.lower()
+    return any(x.lower() in t for x in _LONG_FORM_MARKERS)
 
 
 def _fast_search_terms(user_text: str):
@@ -205,10 +215,11 @@ async def answer(user_text: str):
         asyncio.create_task(_store_conversation_later(user_text, response))
         return response, []
 
-    # 2) Generic work/questions: use the stronger cloud model with recent dialogue.
-    #    No long-term personal memory is sent in this lane.
+    # 2) Generic work/questions: use cloud with recent dialogue.
+    # Long-form deliverables get a much larger output budget; short chat stays fast.
     if not _looks_personal(user_text):
         history = _short_history(8)
+        long_form = _is_long_form_task(user_text)
         messages = [
             {
                 "role": "system",
@@ -218,13 +229,19 @@ async def answer(user_text: str):
                     "Do not repeat questions already answered. "
                     "When the user delegates choices or says 'anything is fine', choose a sensible option and proceed. "
                     "Prefer concrete execution over generic advice or unnecessary clarification. "
+                    "For long-form deliverables, produce the complete deliverable in this response and do not stop mid-section or mid-sentence. "
                     "Answer in the user's language."
                 ),
             },
             *history,
             {"role": "user", "content": user_text},
         ]
-        response = await chat(messages, temperature=0.25, num_predict=520, route="fast_cloud")
+        response = await chat(
+            messages,
+            temperature=0.25,
+            num_predict=1800 if long_form else 520,
+            route="fast_cloud",
+        )
         asyncio.create_task(_store_conversation_later(user_text, response))
         return response, []
 
