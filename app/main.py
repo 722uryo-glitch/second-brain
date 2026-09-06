@@ -31,6 +31,8 @@ from .jobs import (
     job_events,
     artifacts as job_artifacts,
     request_cancel,
+    resume_job,
+    steps as job_steps,
     worker_loop,
     status as jobs_status,
 )
@@ -109,6 +111,7 @@ async def lifespan(app: FastAPI):
     yield
     for task in tasks:
         task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 app = FastAPI(title="Second Brain V3 Persistent Jobs", lifespan=lifespan)
@@ -219,7 +222,8 @@ async def api_get_job(job_id: str):
         raise HTTPException(status_code=404, detail="job not found")
     return {
         "job": job,
-        "events": job_events(job_id, limit=100),
+        "events": job_events(job_id, limit=100, latest=True),
+        "steps": job_steps(job_id),
         "artifacts": job_artifacts(job_id),
     }
 
@@ -236,6 +240,19 @@ async def api_cancel_job(job_id: str):
     if not get_job(job_id):
         raise HTTPException(status_code=404, detail="job not found")
     return {"ok": request_cancel(job_id)}
+
+
+class ResumeIn(BaseModel):
+    extend_budget: bool = False
+
+
+@app.post("/api/jobs/{job_id}/resume")
+async def api_resume_job(job_id: str, data: ResumeIn):
+    if not get_job(job_id):
+        raise HTTPException(status_code=404, detail="job not found")
+    if not resume_job(job_id, extend_budget=data.extend_budget):
+        raise HTTPException(status_code=409, detail="再開できない状態、または予算の追加が必要です。")
+    return {"ok": True, "job": get_job(job_id)}
 
 
 @app.post("/api/chat")

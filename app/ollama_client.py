@@ -4,6 +4,8 @@ import time
 
 import httpx
 
+from .job_context import reserve_call, current as job_context
+
 from .config import (
     OLLAMA_BASE_URL,
     OLLAMA_CHAT_MODEL,
@@ -122,7 +124,7 @@ async def health():
         return r.json()
 
 
-async def _ollama_chat(messages, model=None, temperature=0.4, num_predict=384):
+async def _ollama_chat(messages, model=None, temperature=0.4, num_predict=384, is_fallback=False):
     payload = {
         "model": model or OLLAMA_CHAT_MODEL,
         "messages": messages,
@@ -137,6 +139,7 @@ async def _ollama_chat(messages, model=None, temperature=0.4, num_predict=384):
     attempts = 2
     for attempt in range(attempts):
         try:
+            reserve_call(retry=attempt > 0 or is_fallback, output_tokens=num_predict)
             async with httpx.AsyncClient(timeout=max(15, OLLAMA_INTERACTIVE_TIMEOUT_SECONDS)) as client:
                 r = await client.post(_url("/api/chat"), json=payload)
                 r.raise_for_status()
@@ -158,7 +161,7 @@ async def _ollama_chat(messages, model=None, temperature=0.4, num_predict=384):
     raise last or RuntimeError("Ollama chat failed")
 
 
-async def _uno_one(client, headers, model, messages, temperature, num_predict, timeout_seconds, max_attempts=1):
+async def _uno_one(client, headers, model, messages, temperature, num_predict, timeout_seconds, max_attempts=1, is_fallback=False):
     payload = {
         "model": model,
         "messages": messages,
@@ -171,6 +174,7 @@ async def _uno_one(client, headers, model, messages, temperature, num_predict, t
     for attempt in range(attempts):
         start = time.perf_counter()
         try:
+            reserve_call(retry=attempt > 0 or is_fallback, output_tokens=num_predict)
             r = await client.post(_uno_url("/chat/completions"), headers=headers, json=payload, timeout=timeout_seconds)
             r.raise_for_status()
             data = r.json()
@@ -220,11 +224,11 @@ async def _uno_chat(messages, models, temperature=0.4, num_predict=384, route="c
 
     errors = []
     async with httpx.AsyncClient(follow_redirects=True) as client:
-        for model in available[:max_models]:
+        for model_index, model in enumerate(available[:max_models]):
             try:
                 content, latency = await _uno_one(
                     client, headers, model, messages, temperature, num_predict,
-                    per_model_timeout, max_attempts=max_attempts,
+                    per_model_timeout, max_attempts=max_attempts, is_fallback=model_index > 0,
                 )
                 _ROUTER_STATS["uno_success"] += 1
                 _ROUTER_STATS["last_provider"] = "unorouter"
@@ -268,7 +272,7 @@ async def chat(messages, model=None, temperature=0.4, num_predict=384, route="au
             _ROUTER_STATS["fallbacks"] += 1
             print(f"[AI-ROUTER] UnoRouter failed; fallback=ollama route={route} error={str(exc)[:220]}")
 
-    return await _ollama_chat(messages, model, temperature, num_predict)
+    return await _ollama_chat(messages, model, temperature, num_predict, is_fallback=cloud_allowed)
 
 
 def router_status():
@@ -296,6 +300,7 @@ async def embed(text: str, model=None):
     attempts = max(1, min(2, LLM_MAX_RETRIES + 1))
     for attempt in range(attempts):
         try:
+            reserve_call(retry=attempt > 0)
             async with httpx.AsyncClient(timeout=45) as client:
                 r = await client.post(_url("/api/embed"), json=payload)
                 r.raise_for_status()

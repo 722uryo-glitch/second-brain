@@ -1,4 +1,6 @@
 import json
+import hashlib
+from .job_context import current as job_context
 import re
 import sqlite3
 import threading
@@ -9,10 +11,18 @@ from .config import DB_PATH
 _lock = threading.RLock()
 
 
+class _ClosingConnection(sqlite3.Connection):
+    def __exit__(self, *args):
+        try:
+            return super().__exit__(*args)
+        finally:
+            self.close()
+
+
 def _connect():
     path = Path(DB_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, check_same_thread=False)
+    conn = sqlite3.connect(path, check_same_thread=False, factory=_ClosingConnection)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -21,6 +31,7 @@ def init_db():
     with _lock, _connect() as conn:
         conn.executescript(
             """
+            CREATE TABLE IF NOT EXISTS job_effects (job_id TEXT NOT NULL, effect_key TEXT NOT NULL, result_id INTEGER NOT NULL, PRIMARY KEY(job_id,effect_key));
             CREATE TABLE IF NOT EXISTS memories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL,
@@ -115,14 +126,34 @@ def init_db():
         conn.commit()
 
 
+def _job_effect(conn, kind, payload):
+    context = job_context.get()
+    if context is None:
+        return None, None
+    conn.execute("BEGIN IMMEDIATE")
+    context.check(conn)
+    key = kind + ":" + hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+    row = conn.execute("SELECT result_id FROM job_effects WHERE job_id=? AND effect_key=?", (context.job_id, key)).fetchone()
+    return (context.job_id, key), row[0] if row else None
+
+
+def _save_job_effect(conn, key, result_id):
+    if key:
+        conn.execute("INSERT INTO job_effects(job_id,effect_key,result_id) VALUES(?,?,?)", (*key, result_id))
+
+
 def add_memory(kind, source, content, importance=0.5, embedding=None, metadata=None):
     now = datetime.now(timezone.utc).isoformat()
     with _lock, _connect() as conn:
+        key, previous = _job_effect(conn, "memory", [kind, source, content])
+        if previous is not None:
+            return previous
         cur = conn.execute(
             "INSERT INTO memories(created_at, kind, source, content, importance, embedding_json, metadata_json) VALUES(?,?,?,?,?,?,?)",
             (now, kind, source, content, float(importance), json.dumps(embedding) if embedding is not None else None,
              json.dumps(metadata or {}, ensure_ascii=False)),
         )
+        _save_job_effect(conn, key, cur.lastrowid)
         conn.commit()
         return cur.lastrowid
 
@@ -392,6 +423,9 @@ def recent_claims(limit=100):
 def start_agent_run(user_request: str, goal: str = "", mode: str = "unknown", plan=None, metadata=None):
     now = datetime.now(timezone.utc).isoformat()
     with _lock, _connect() as conn:
+        key, previous = _job_effect(conn, "agent_run", user_request)
+        if previous is not None:
+            return previous
         cur = conn.execute(
             """INSERT INTO agent_runs(created_at,user_request,goal,mode,status,plan_json,metadata_json)
                VALUES(?,?,?,?,?,?,?)""",
@@ -401,6 +435,7 @@ def start_agent_run(user_request: str, goal: str = "", mode: str = "unknown", pl
                 json.dumps(metadata or {}, ensure_ascii=False),
             ),
         )
+        _save_job_effect(conn, key, cur.lastrowid)
         conn.commit()
         return int(cur.lastrowid)
 
@@ -409,6 +444,9 @@ def add_agent_step(run_id: int, step_no: int, step_type: str, label: str = "", s
                    input_data=None, output_data=None, duration_ms=None, error=None):
     now = datetime.now(timezone.utc).isoformat()
     with _lock, _connect() as conn:
+        key, previous = _job_effect(conn, "agent_step", [run_id, step_no, step_type])
+        if previous is not None:
+            return previous
         cur = conn.execute(
             """INSERT INTO agent_steps(run_id,created_at,step_no,step_type,label,status,input_json,output_json,duration_ms,error)
                VALUES(?,?,?,?,?,?,?,?,?,?)""",
@@ -420,6 +458,7 @@ def add_agent_step(run_id: int, step_no: int, step_type: str, label: str = "", s
                 str(error)[:1000] if error else None,
             ),
         )
+        _save_job_effect(conn, key, cur.lastrowid)
         conn.commit()
         return int(cur.lastrowid)
 
@@ -427,6 +466,10 @@ def add_agent_step(run_id: int, step_no: int, step_type: str, label: str = "", s
 def finish_agent_run(run_id: int, status: str, final_response: str = "", critique=None, error=None, metadata=None):
     now = datetime.now(timezone.utc).isoformat()
     with _lock, _connect() as conn:
+        context = job_context.get()
+        if context is not None:
+            conn.execute("BEGIN IMMEDIATE")
+            context.check(conn)
         conn.execute(
             """UPDATE agent_runs
                SET finished_at=?,status=?,final_response=?,critique_json=?,error=?,metadata_json=?

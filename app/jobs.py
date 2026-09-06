@@ -1,5 +1,7 @@
 import asyncio
 import json
+import inspect
+from contextlib import closing
 import os
 import sqlite3
 import threading
@@ -7,6 +9,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from .job_context import current as job_context, JobStopped, BudgetExceeded
 from .config import DB_PATH
 from .executive import run as executive_run
 from .orchestrator import is_research_task, is_current_task
@@ -31,6 +34,7 @@ def _connect():
     path = Path(DB_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, check_same_thread=False)
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -44,7 +48,7 @@ def _future(seconds):
 
 
 def init_jobs():
-    with _lock, _connect() as conn:
+    with _lock, closing(_connect()) as conn:
         conn.executescript(
             """
             PRAGMA journal_mode=WAL;
@@ -97,25 +101,52 @@ def init_jobs():
             CREATE INDEX IF NOT EXISTS idx_job_artifacts_job ON job_artifacts(job_id, id);
             """
         )
-        # This deployment intentionally runs one local worker process. A process
-        # restart invalidates every old worker id, so running jobs can be requeued
-        # immediately instead of waiting for their previous lease to expire.
-        now = _now()
-        conn.execute(
-            """UPDATE jobs
-               SET status='queued', worker_id=NULL, lease_expires_at=NULL,
-                   current_step='recovered_after_restart', updated_at=?
-               WHERE status='running' AND cancel_requested=0""",
-            (now,),
-        )
-        conn.execute(
-            """UPDATE jobs
-               SET status='cancelled', finished_at=?, updated_at=?, current_step='cancelled',
-                   worker_id=NULL, lease_expires_at=NULL
-               WHERE status IN ('queued','running') AND cancel_requested=1""",
-            (now, now),
-        )
+        conn.execute("BEGIN IMMEDIATE")
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
+        for name, declaration in {
+            "deadline_at": "TEXT", "calls_used": "INTEGER NOT NULL DEFAULT 0",
+            "retries_used": "INTEGER NOT NULL DEFAULT 0", "output_tokens_reserved": "INTEGER NOT NULL DEFAULT 0",
+            "max_calls": "INTEGER NOT NULL DEFAULT 120", "max_retries": "INTEGER NOT NULL DEFAULT 12",
+            "max_output_tokens": "INTEGER NOT NULL DEFAULT 40000",
+        }.items():
+            if name not in columns:
+                conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {declaration}")
+        conn.execute("""CREATE TABLE IF NOT EXISTS job_steps (
+            job_id TEXT NOT NULL, step_key TEXT NOT NULL, input_json TEXT NOT NULL,
+            status TEXT NOT NULL, output_json TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+            started_at TEXT, finished_at TEXT, error TEXT, worker_id TEXT,
+            PRIMARY KEY(job_id, step_key))""")
+        # Initializing a second API process must not revoke a live worker.
+        _recover(conn)
         conn.commit()
+
+
+def _event(conn, job_id, event_type, message, data=None):
+    conn.execute("INSERT INTO job_events(job_id,created_at,event_type,message,data_json) VALUES(?,?,?,?,?)",
+                 (job_id, _now(), event_type, str(message)[:1000], json.dumps(data or {}, ensure_ascii=False)))
+
+
+def _recover(conn):
+    now = _now()
+    expired = conn.execute("""SELECT id,cancel_requested FROM jobs WHERE status='running'
+        AND (lease_expires_at IS NULL OR lease_expires_at <= ?)""", (now,)).fetchall()
+    for row in expired:
+        state = "cancelled" if row["cancel_requested"] else "queued"
+        conn.execute("""UPDATE jobs SET status=?,worker_id=NULL,lease_expires_at=NULL,
+            current_step=?,updated_at=?,finished_at=? WHERE id=?""",
+            (state, "recovered_after_lease_expiry", now, now if state == "cancelled" else None, row["id"]))
+        conn.execute("UPDATE job_steps SET status='interrupted' WHERE job_id=? AND status='running'", (row["id"],))
+        _event(conn, row["id"], "recovered", "実行権の期限切れを検出しました。保存済み工程から再開します。")
+
+
+def _owned(conn, job_id, worker_id, allow_cancel=False):
+    row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if not row or row["status"] != "running" or row["worker_id"] != worker_id or not row["lease_expires_at"] or row["lease_expires_at"] <= _now():
+        raise JobStopped("worker lease lost")
+    if row["cancel_requested"] and not allow_cancel:
+        raise JobStopped("cancel requested")
+    return row
+
 
 
 def should_enqueue(text: str) -> bool:
@@ -128,7 +159,7 @@ def should_enqueue(text: str) -> bool:
 
 
 def add_event(job_id: str, event_type: str, message: str = "", data=None):
-    with _lock, _connect() as conn:
+    with _lock, closing(_connect()) as conn:
         conn.execute(
             "INSERT INTO job_events(job_id,created_at,event_type,message,data_json) VALUES(?,?,?,?,?)",
             (job_id, _now(), event_type, str(message or "")[:1000], json.dumps(data or {}, ensure_ascii=False)),
@@ -139,15 +170,15 @@ def add_event(job_id: str, event_type: str, message: str = "", data=None):
 def create_job(request: str, max_runtime_seconds=None, metadata=None):
     job_id = uuid.uuid4().hex
     now = _now()
-    runtime = int(max_runtime_seconds or JOB_MAX_RUNTIME_SECONDS)
-    with _lock, _connect() as conn:
+    runtime = max(1, int(max_runtime_seconds if max_runtime_seconds is not None else JOB_MAX_RUNTIME_SECONDS))
+    with _lock, closing(_connect()) as conn:
         conn.execute(
             """INSERT INTO jobs(id,created_at,updated_at,request,status,current_step,max_runtime_seconds,metadata_json)
                VALUES(?,?,?,?,?,?,?,?)""",
             (job_id, now, now, request, "queued", "accepted", runtime, json.dumps(metadata or {}, ensure_ascii=False)),
         )
+        _event(conn, job_id, "accepted", "依頼を保存しました。バックグラウンドで処理します。")
         conn.commit()
-    add_event(job_id, "accepted", "依頼を保存しました。バックグラウンドで処理します。")
     return get_job(job_id)
 
 
@@ -164,23 +195,25 @@ def _decode(row):
 
 
 def get_job(job_id: str):
-    with _lock, _connect() as conn:
+    with _lock, closing(_connect()) as conn:
         row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
     return _decode(row)
 
 
 def list_jobs(limit=30):
-    with _lock, _connect() as conn:
+    with _lock, closing(_connect()) as conn:
         rows = conn.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (int(limit),)).fetchall()
     return [_decode(r) for r in rows]
 
 
-def job_events(job_id: str, after_id=0, limit=200):
-    with _lock, _connect() as conn:
+def job_events(job_id: str, after_id=0, limit=200, latest=False):
+    with _lock, closing(_connect()) as conn:
         rows = conn.execute(
-            "SELECT * FROM job_events WHERE job_id=? AND id>? ORDER BY id ASC LIMIT ?",
+            "SELECT * FROM job_events WHERE job_id=? AND id>? ORDER BY id " + ("DESC" if latest else "ASC") + " LIMIT ?",
             (job_id, int(after_id), int(limit)),
         ).fetchall()
+    if latest:
+        rows = list(reversed(rows))
     out = []
     for row in rows:
         d = dict(row)
@@ -193,46 +226,36 @@ def job_events(job_id: str, after_id=0, limit=200):
 
 
 def artifacts(job_id: str):
-    with _lock, _connect() as conn:
+    with _lock, closing(_connect()) as conn:
         rows = conn.execute("SELECT * FROM job_artifacts WHERE job_id=? ORDER BY id ASC", (job_id,)).fetchall()
     return [dict(r) for r in rows]
 
 
 def request_cancel(job_id: str):
-    now = _now()
-    event_type = None
-    with _lock, _connect() as conn:
+    with _lock, closing(_connect()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
         if not row or row["status"] not in {"queued", "running"}:
             return False
-        if row["status"] == "queued":
-            conn.execute(
-                """UPDATE jobs SET cancel_requested=1,status='cancelled',finished_at=?,updated_at=?,current_step='cancelled'
-                   WHERE id=?""",
-                (now, now, job_id),
-            )
-            event_type = "cancelled"
-        else:
-            conn.execute("UPDATE jobs SET cancel_requested=1,updated_at=? WHERE id=?", (now, job_id))
-            event_type = "cancel_requested"
+        # Terminal cancellation also fences any in-flight completion.
+        conn.execute("""UPDATE jobs SET cancel_requested=1,status='cancelled',finished_at=?,
+            updated_at=?,current_step='cancelled',worker_id=NULL,lease_expires_at=NULL WHERE id=?""",
+            (_now(), _now(), job_id))
+        conn.execute("UPDATE job_steps SET status='interrupted' WHERE job_id=? AND status='running'", (job_id,))
+        _event(conn, job_id, "cancelled", "取消済み。実行中の子処理を終了します。途中成果は保持します。")
         conn.commit()
-    add_event(
-        job_id,
-        event_type,
-        "Jobを取り消しました。" if event_type == "cancelled" else "取消要求を受け付けました。現在の子処理にも伝播します。",
-    )
     return True
 
 
 def _claim_job(worker_id: str):
+    worker_id = worker_id + ":" + uuid.uuid4().hex
     now = _now()
-    with _lock, _connect() as conn:
+    with _lock, closing(_connect()) as conn:
         conn.execute("BEGIN IMMEDIATE")
-        conn.execute(
-            """UPDATE jobs SET status='queued',worker_id=NULL,lease_expires_at=NULL,current_step='recovered_after_lease_expiry',updated_at=?
-               WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at < ? AND cancel_requested=0""",
-            (now, now),
-        )
+        _recover(conn)
+        if conn.execute("SELECT 1 FROM jobs WHERE status='running' LIMIT 1").fetchone():
+            conn.commit()
+            return None
         row = conn.execute(
             "SELECT * FROM jobs WHERE status='queued' AND cancel_requested=0 ORDER BY created_at ASC LIMIT 1"
         ).fetchone()
@@ -241,101 +264,196 @@ def _claim_job(worker_id: str):
             return None
         conn.execute(
             """UPDATE jobs SET status='running',started_at=COALESCE(started_at,?),updated_at=?,current_step='starting',
-               worker_id=?,lease_expires_at=?,heartbeat_at=?,attempts=attempts+1 WHERE id=?""",
-            (now, now, worker_id, _future(JOB_LEASE_SECONDS), now, row["id"]),
+               worker_id=?,lease_expires_at=?,heartbeat_at=?,attempts=attempts+1,deadline_at=COALESCE(deadline_at,?) WHERE id=?""",
+            (now, now, worker_id, _future(JOB_LEASE_SECONDS), now, _future(row["max_runtime_seconds"]), row["id"]),
         )
+        _event(conn, row["id"], "started", "Workerが処理を開始しました。", {"worker_id": worker_id})
+        claimed = conn.execute("SELECT * FROM jobs WHERE id=?", (row["id"],)).fetchone()
         conn.commit()
-    add_event(row["id"], "started", "Workerが処理を開始しました。", {"worker_id": worker_id})
-    return get_job(row["id"])
+    return _decode(claimed)
 
 
 def _heartbeat(job_id: str, worker_id: str, step=None):
-    now = _now()
-    with _lock, _connect() as conn:
-        conn.execute(
-            """UPDATE jobs SET heartbeat_at=?,updated_at=?,lease_expires_at=?,current_step=COALESCE(?,current_step)
-               WHERE id=? AND worker_id=? AND status='running'""",
-            (now, now, _future(JOB_LEASE_SECONDS), step, job_id, worker_id),
-        )
+    with _lock, closing(_connect()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _owned(conn, job_id, worker_id)
+        conn.execute("""UPDATE jobs SET heartbeat_at=?,updated_at=?,lease_expires_at=?,
+            current_step=COALESCE(?,current_step) WHERE id=?""",
+            (_now(), _now(), _future(JOB_LEASE_SECONDS), step, job_id))
         conn.commit()
 
 
-def _finish(job_id: str, worker_id: str, status: str, result_text="", error="", agent_run_id=None):
-    now = _now()
-    with _lock, _connect() as conn:
-        conn.execute(
-            """UPDATE jobs SET status=?,finished_at=?,updated_at=?,current_step=?,result_text=?,error=?,agent_run_id=?,
-               worker_id=NULL,lease_expires_at=NULL,heartbeat_at=?
-               WHERE id=? AND worker_id=?""",
-            (status, now, now, status, result_text, str(error or "")[:3000], agent_run_id, now, job_id, worker_id),
-        )
+def _finish(job_id, worker_id, status, result_text="", error="", agent_run_id=None):
+    with _lock, closing(_connect()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _owned(conn, job_id, worker_id)
+        except JobStopped:
+            return False
+        conn.execute("""UPDATE jobs SET status=?,finished_at=?,updated_at=?,current_step=?,
+            result_text=?,error=?,agent_run_id=?,worker_id=NULL,lease_expires_at=NULL WHERE id=?""",
+            (status, _now(), _now(), status, result_text, str(error)[:3000], agent_run_id, job_id))
         if result_text:
-            conn.execute(
-                "INSERT INTO job_artifacts(job_id,created_at,kind,title,content,metadata_json) VALUES(?,?,?,?,?,?)",
-                (job_id, now, "final_response", "Final response", result_text, json.dumps({"agent_run_id": agent_run_id}, ensure_ascii=False)),
-            )
+            conn.execute("INSERT INTO job_artifacts(job_id,created_at,kind,title,content,metadata_json) VALUES(?,?,?,?,?,?)",
+                (job_id, _now(), "final_response", "最終応答", result_text, "{}"))
+        conn.execute("UPDATE job_steps SET status='interrupted' WHERE job_id=? AND status='running'", (job_id,))
+        _event(conn, job_id, status, "完了しました。" if status == "succeeded" else (error or status))
         conn.commit()
-    add_event(job_id, status, "処理が完了しました。" if status == "succeeded" else str(error or status)[:1000])
+    return True
 
 
-async def _heartbeat_loop(job_id: str, worker_id: str):
-    while True:
-        await asyncio.sleep(max(3, JOB_HEARTBEAT_SECONDS))
-        _heartbeat(job_id, worker_id)
+def steps(job_id):
+    with _lock, closing(_connect()) as conn:
+        return [dict(r) for r in conn.execute("SELECT * FROM job_steps WHERE job_id=? ORDER BY started_at,step_key", (job_id,))]
 
 
-async def _execute(job: dict, worker_id: str):
+def resume_job(job_id, extend_budget=False):
+    with _lock, closing(_connect()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if not row or row["status"] not in {"failed", "partial", "cancelled"}:
+            return False
+        complete = conn.execute("SELECT 1 FROM job_steps WHERE job_id=? AND step_key='v1:final' AND status='succeeded'", (job_id,)).fetchone()
+        if complete and not row["error"]:
+            return False
+        if extend_budget:
+            # Explicit user action grants one more original time/call/token allowance.
+            conn.execute("""UPDATE jobs SET deadline_at=?,max_calls=max_calls+120,
+                max_retries=max_retries+12,max_output_tokens=max_output_tokens+40000 WHERE id=?""",
+                (_future(row["max_runtime_seconds"]), job_id))
+        elif row["deadline_at"] and row["deadline_at"] <= _now():
+            return False
+        conn.execute("""UPDATE jobs SET status='queued',cancel_requested=0,worker_id=NULL,
+            lease_expires_at=NULL,finished_at=NULL,error=NULL,result_text=NULL,current_step='resume_queued',updated_at=? WHERE id=?""", (_now(), job_id))
+        _event(conn, job_id, "resume_queued", "保存済み工程から再開します。", {"budget_extended": extend_budget})
+        conn.commit()
+    return True
+
+
+class Execution:
+    def __init__(self, job, worker_id):
+        self.job_id, self.worker_id = job["id"], worker_id
+
+    def check(self, conn):
+        row = _owned(conn, self.job_id, self.worker_id)
+        if row["deadline_at"] and row["deadline_at"] <= _now():
+            raise BudgetExceeded("job runtime budget exhausted")
+        return row
+
+    def reserve(self, retry=False, output_tokens=0):
+        with _lock, closing(_connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = self.check(conn)
+            if (row["calls_used"] + 1 > row["max_calls"] or
+                row["retries_used"] + int(retry) > row["max_retries"] or
+                row["output_tokens_reserved"] + output_tokens > row["max_output_tokens"]):
+                raise BudgetExceeded("job call/retry/output-token budget exhausted")
+            conn.execute("""UPDATE jobs SET calls_used=calls_used+1,retries_used=retries_used+?,
+                output_tokens_reserved=output_tokens_reserved+? WHERE id=?""", (int(retry), output_tokens, self.job_id))
+            conn.commit()
+
+    async def step(self, key, inputs, operation, kind):
+        encoded = json.dumps(inputs, ensure_ascii=False, sort_keys=True)
+        # Versioned keys prevent accidental reuse under a changed workflow contract.
+        key = "v1:" + key
+        with _lock, closing(_connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self.check(conn)
+            old = conn.execute("SELECT * FROM job_steps WHERE job_id=? AND step_key=?", (self.job_id, key)).fetchone()
+            if old and old["input_json"] != encoded:
+                raise RuntimeError("checkpoint input changed: " + key)
+            if old and old["status"] == "succeeded":
+                _event(conn, self.job_id, "step_reused", "保存済み工程を再利用: " + key, {"step": key})
+                conn.commit()
+                return json.loads(old["output_json"])
+            if old:
+                row = self.check(conn)
+                if row["retries_used"] >= row["max_retries"]:
+                    raise BudgetExceeded("job retry budget exhausted on step resume")
+                conn.execute("UPDATE jobs SET retries_used=retries_used+1 WHERE id=?", (self.job_id,))
+            conn.execute("""INSERT INTO job_steps(job_id,step_key,input_json,status,attempts,started_at,worker_id)
+                VALUES(?,?,?,'running',1,?,?) ON CONFLICT(job_id,step_key) DO UPDATE SET
+                status='running',attempts=attempts+1,worker_id=excluded.worker_id,error=NULL""",
+                (self.job_id, key, encoded, _now(), self.worker_id))
+            conn.execute("UPDATE jobs SET current_step=?,updated_at=? WHERE id=?", (key, _now(), self.job_id))
+            _event(conn, self.job_id, "step_started", "実行中: " + key, {"step": key})
+            conn.commit()
+        try:
+            value = operation()
+            if inspect.isawaitable(value):
+                value = await value
+            output = json.dumps(value, ensure_ascii=False)
+            with _lock, closing(_connect()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                self.check(conn)
+                conn.execute("""UPDATE job_steps SET status='succeeded',output_json=?,finished_at=?,error=NULL
+                    WHERE job_id=? AND step_key=? AND worker_id=?""", (output, _now(), self.job_id, key, self.worker_id))
+                conn.execute("INSERT INTO job_artifacts(job_id,created_at,kind,title,content,metadata_json) VALUES(?,?,?,?,?,?)",
+                    (self.job_id, _now(), kind, key, value if isinstance(value, str) else output,
+                     json.dumps({"step": key, "verified": False})))
+                _event(conn, self.job_id, "step_completed", "保存済み: " + key, {"step": key})
+                conn.commit()
+            return json.loads(output)
+        except BaseException as exc:
+            with _lock, closing(_connect()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    _owned(conn, self.job_id, self.worker_id)
+                except JobStopped:
+                    pass
+                else:
+                    conn.execute("UPDATE job_steps SET status=?,error=? WHERE job_id=? AND step_key=?",
+                        ("interrupted" if isinstance(exc, asyncio.CancelledError) else "failed", str(exc)[:1000], self.job_id, key))
+                    conn.commit()
+            raise
+
+
+async def _execute(job, worker_id):
     job_id = job["id"]
-    current = get_job(job_id)
-    if current and current.get("cancel_requested"):
-        _finish(job_id, worker_id, "cancelled", error="cancelled before start")
-        return
+    context = Execution(job, worker_id)
+    token = job_context.set(context)
 
     def reporter(step, message, data):
-        _heartbeat(job_id, worker_id, step)
-        add_event(job_id, "progress", message or step, {"step": step, **(data or {})})
+        with _lock, closing(_connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            context.check(conn)
+            _event(conn, job_id, "progress", message or step, {"step": step, **(data or {})})
+            conn.commit()
 
-    _heartbeat(job_id, worker_id, "executive")
-    add_event(job_id, "progress", "目的整理・記憶検索・必要情報の調査を開始しました。", {"step": "executive"})
-    hb = asyncio.create_task(_heartbeat_loop(job_id, worker_id))
-    token = set_reporter(reporter)
+    progress_token = set_reporter(reporter)
+    next_heartbeat = 0.0
     task = asyncio.create_task(executive_run(job["request"]))
-    deadline = asyncio.get_running_loop().time() + max(30, int(job.get("max_runtime_seconds") or JOB_MAX_RUNTIME_SECONDS))
     try:
         while not task.done():
-            current = get_job(job_id)
-            if current and current.get("cancel_requested"):
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                _finish(job_id, worker_id, "cancelled", error="cancel requested")
-                return
-            if asyncio.get_running_loop().time() >= deadline:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                _finish(job_id, worker_id, "partial", error="job runtime budget exhausted")
-                return
-            await asyncio.sleep(0.8)
-
+            with closing(_connect()) as conn:
+                context.check(conn)
+            now_mono = asyncio.get_running_loop().time()
+            if now_mono >= next_heartbeat:
+                _heartbeat(job_id, worker_id)
+                next_heartbeat = now_mono + max(0.2, min(JOB_HEARTBEAT_SECONDS, JOB_LEASE_SECONDS / 3))
+            await asyncio.wait({task}, timeout=min(0.25, max(0.05, JOB_HEARTBEAT_SECONDS)))
         result = task.result()
-        current = get_job(job_id)
-        if current and current.get("cancel_requested"):
-            _finish(job_id, worker_id, "cancelled", error="cancel requested")
-            return
-        _finish(job_id, worker_id, "succeeded", result_text=result.response, agent_run_id=result.run_id)
+        outcome = "partial" if result.critique and not result.critique.get("pass", False) else "succeeded"
+        _finish(job_id, worker_id, outcome, result.response, agent_run_id=result.run_id)
+    except BudgetExceeded as exc:
+        saved = [a for a in artifacts(job_id) if a["kind"] == "answer"]
+        _finish(job_id, worker_id, "partial", result_text=saved[-1]["content"] if saved else "", error=str(exc))
+    except JobStopped:
+        pass  # Cancel endpoint or a newer lease owns the terminal state.
     except asyncio.CancelledError:
-        task.cancel()
+        # Graceful shutdown releases only this lease; hard crashes use lease expiry.
+        with _lock, closing(_connect()) as conn:
+            conn.execute("UPDATE jobs SET lease_expires_at=? WHERE id=? AND worker_id=? AND status='running'",
+                         (_now(), job_id, worker_id))
+            conn.commit()
         raise
-    except Exception as e:
-        _finish(job_id, worker_id, "failed", error=str(e))
+    except Exception as exc:
+        _finish(job_id, worker_id, "partial" if artifacts(job_id) else "failed", error=str(exc))
     finally:
-        reset_reporter(token)
-        hb.cancel()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        reset_reporter(progress_token)
+        job_context.reset(token)
 
 
 async def worker_loop():
@@ -345,7 +463,7 @@ async def worker_loop():
         try:
             job = _claim_job(worker_id)
             if job:
-                await _execute(job, worker_id)
+                await _execute(job, job["worker_id"])
             else:
                 await asyncio.sleep(max(0.2, JOB_POLL_SECONDS))
         except asyncio.CancelledError:
@@ -356,7 +474,7 @@ async def worker_loop():
 
 
 def status():
-    with _lock, _connect() as conn:
+    with _lock, closing(_connect()) as conn:
         counts = {r["status"]: int(r["c"]) for r in conn.execute("SELECT status,COUNT(*) c FROM jobs GROUP BY status").fetchall()}
         oldest = conn.execute("SELECT created_at FROM jobs WHERE status='queued' ORDER BY created_at ASC LIMIT 1").fetchone()
     return {
