@@ -138,6 +138,86 @@ def recent_external_items(limit=100):
     return [dict(r) for r in rows]
 
 
+def _clean_search_terms(terms, max_terms=10):
+    out = []
+    seen = set()
+    for term in terms or []:
+        t = str(term or "").strip().lower()
+        if len(t) < 2 or t in seen:
+            continue
+        seen.add(t)
+        out.append(t[:80])
+        if len(out) >= max_terms:
+            break
+    return out
+
+
+def search_external_items(terms, limit=30):
+    """Search recent collected intelligence by several multilingual/English terms.
+
+    This intentionally uses simple LIKE queries rather than requiring an FTS migration,
+    so existing user databases become searchable immediately after updating.
+    """
+    terms = _clean_search_terms(terms)
+    if not terms:
+        return []
+    clauses = []
+    params = []
+    for term in terms:
+        clauses.append("(lower(title) LIKE ? OR lower(COALESCE(summary,'')) LIKE ? OR lower(source) LIKE ?)")
+        pat = f"%{term}%"
+        params.extend([pat, pat, pat])
+    sql = f"""
+        SELECT * FROM external_items
+        WHERE {' OR '.join(clauses)}
+        ORDER BY id DESC
+        LIMIT ?
+    """
+    params.append(int(limit))
+    with _lock, _connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def search_claims(terms, limit=20):
+    terms = _clean_search_terms(terms)
+    if not terms:
+        return []
+    clauses = []
+    params = []
+    for term in terms:
+        clauses.append("(lower(claim_text) LIKE ? OR lower(claim_key) LIKE ?)")
+        pat = f"%{term}%"
+        params.extend([pat, pat])
+    sql = f"""
+        SELECT * FROM intelligence_claims
+        WHERE {' OR '.join(clauses)}
+        ORDER BY confidence DESC, updated_at DESC
+        LIMIT ?
+    """
+    params.append(int(limit))
+    with _lock, _connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def claim_evidence_sources(claim_id, limit=8):
+    with _lock, _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT ce.stance,ce.credibility,ce.source_domain,ce.source_type,
+                   e.source,e.title,e.url,e.published_at,e.collected_at
+            FROM claim_evidence ce
+            JOIN external_items e ON e.id=ce.external_item_id
+            WHERE ce.claim_id=?
+            ORDER BY ce.credibility DESC, e.id DESC
+            LIMIT ?
+            """,
+            (int(claim_id), int(limit)),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def unprocessed_external_items(limit=100):
     with _lock, _connect() as conn:
         rows = conn.execute(
