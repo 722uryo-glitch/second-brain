@@ -76,6 +76,39 @@ def init_db():
                 FOREIGN KEY(external_item_id) REFERENCES external_items(id)
             );
             CREATE INDEX IF NOT EXISTS idx_evidence_claim ON claim_evidence(claim_id);
+
+            CREATE TABLE IF NOT EXISTS agent_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                finished_at TEXT,
+                user_request TEXT NOT NULL,
+                goal TEXT,
+                mode TEXT NOT NULL DEFAULT 'unknown',
+                status TEXT NOT NULL DEFAULT 'running',
+                plan_json TEXT,
+                critique_json TEXT,
+                final_response TEXT,
+                error TEXT,
+                metadata_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_runs_created ON agent_runs(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_agent_runs_status ON agent_runs(status);
+
+            CREATE TABLE IF NOT EXISTS agent_steps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                step_no INTEGER NOT NULL,
+                step_type TEXT NOT NULL,
+                label TEXT,
+                status TEXT NOT NULL DEFAULT 'ok',
+                input_json TEXT,
+                output_json TEXT,
+                duration_ms INTEGER,
+                error TEXT,
+                FOREIGN KEY(run_id) REFERENCES agent_runs(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_steps_run ON agent_steps(run_id, step_no);
             """
         )
         conn.commit()
@@ -100,11 +133,6 @@ def recent_memories(limit=30):
 
 
 def recent_conversation(limit=10):
-    """Return recent user/assistant conversation turns in chronological order.
-
-    This is deliberately separate from semantic long-term recall: normal dialogue
-    continuity should not depend on embedding similarity.
-    """
     with _lock, _connect() as conn:
         rows = conn.execute(
             """
@@ -299,3 +327,75 @@ def recent_claims(limit=100):
     with _lock, _connect() as conn:
         rows = conn.execute("SELECT * FROM intelligence_claims ORDER BY updated_at DESC LIMIT ?", (int(limit),)).fetchall()
     return [dict(r) for r in rows]
+
+
+def start_agent_run(user_request: str, goal: str = "", mode: str = "unknown", plan=None, metadata=None):
+    now = datetime.now(timezone.utc).isoformat()
+    with _lock, _connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO agent_runs(created_at,user_request,goal,mode,status,plan_json,metadata_json)
+               VALUES(?,?,?,?,?,?,?)""",
+            (
+                now,
+                user_request,
+                goal,
+                mode,
+                "running",
+                json.dumps(plan or {}, ensure_ascii=False),
+                json.dumps(metadata or {}, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def add_agent_step(run_id: int, step_no: int, step_type: str, label: str = "", status: str = "ok",
+                   input_data=None, output_data=None, duration_ms=None, error=None):
+    now = datetime.now(timezone.utc).isoformat()
+    with _lock, _connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO agent_steps(run_id,created_at,step_no,step_type,label,status,input_json,output_json,duration_ms,error)
+               VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (
+                int(run_id), now, int(step_no), step_type, label, status,
+                json.dumps(input_data or {}, ensure_ascii=False),
+                json.dumps(output_data or {}, ensure_ascii=False),
+                int(duration_ms) if duration_ms is not None else None,
+                str(error)[:1000] if error else None,
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def finish_agent_run(run_id: int, status: str, final_response: str = "", critique=None, error=None, metadata=None):
+    now = datetime.now(timezone.utc).isoformat()
+    with _lock, _connect() as conn:
+        conn.execute(
+            """UPDATE agent_runs
+               SET finished_at=?,status=?,final_response=?,critique_json=?,error=?,metadata_json=?
+               WHERE id=?""",
+            (
+                now,
+                status,
+                final_response,
+                json.dumps(critique or {}, ensure_ascii=False),
+                str(error)[:2000] if error else None,
+                json.dumps(metadata or {}, ensure_ascii=False),
+                int(run_id),
+            ),
+        )
+        conn.commit()
+
+
+def recent_agent_runs(limit=20, include_steps=False):
+    with _lock, _connect() as conn:
+        rows = conn.execute("SELECT * FROM agent_runs ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
+        result = [dict(r) for r in rows]
+        if include_steps:
+            for run in result:
+                steps = conn.execute(
+                    "SELECT * FROM agent_steps WHERE run_id=? ORDER BY step_no ASC,id ASC", (run["id"],)
+                ).fetchall()
+                run["steps"] = [dict(s) for s in steps]
+    return result
