@@ -4,13 +4,18 @@ from .memory import store_memory
 from .ollama_client import chat
 
 
+async def answer_detailed(user_text: str):
+    """Run the full Second Brain and return its exact ExecutiveResult."""
+    return await executive_run(user_text)
+
+
 async def answer(user_text: str):
-    """Primary chat entry point.
+    """Backward-compatible primary chat entry point.
 
     Every non-trivial request passes through the executive Second Brain:
     planning -> memory/research retrieval -> drafting -> self-review -> revision.
     """
-    result = await executive_run(user_text)
+    result = await answer_detailed(user_text)
     return result.response, result.memories
 
 
