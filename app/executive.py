@@ -238,13 +238,22 @@ Rules:
 
 
 async def _gather_memory(user_text: str, needs_memory: bool):
-    if not needs_memory:
-        return []
+    memories=[]
+    if needs_memory:
+        try:
+            memories=await recall(user_text, top_k=8)
+        except Exception as e:
+            print(f"[EXECUTIVE] memory recall failed: {e}")
     try:
-        return await recall(user_text, top_k=8)
+        from . import knowledge as k
+        k.init_knowledge()
+        notes=k.related({'id':-1,'title':user_text,'content':user_text,'topics':[]},limit=4)
+        for n in notes:
+            memories.append({'id':'knowledge:'+str(n['id']),'kind':'knowledge','source':n['source_url'] or n['origin'],
+              'importance':0.6,'content':'[資料の解釈・未検証] '+n['content'][:1800]})
     except Exception as e:
-        print(f"[EXECUTIVE] memory recall failed: {e}")
-        return []
+        print(f"[EXECUTIVE] knowledge recall failed: {e}")
+    return memories
 
 
 def _memory_context(memories: list):
@@ -473,7 +482,7 @@ Do NOT fail a generic heading, a description of the user's strategy, or a clearl
             ],
             temperature=0.0,
             num_predict=500,
-            route="verify",
+            route="local" if plan.get("needs_memory") and not UNOROUTER_PRIVATE_CHAT else "verify",
         )
         result = _extract_json_object(raw)
     except Exception as e:
@@ -622,6 +631,8 @@ async def run(user_text: str):
     try:
         memory_start = _now_ms()
         memories = await _step("memory", _gather_memory, user_text, bool(plan.get("needs_memory")))
+        if memories:
+            plan["needs_memory"] = True  # Retrieved notes may be private; keep generation local.
         add_agent_step(
             run_id, step_no, "memory", "Retrieve relevant long-term memory",
             output_data={"count": len(memories), "ids": [m.get("id") for m in memories[:8]]},

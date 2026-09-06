@@ -6,6 +6,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from .config import DB_PATH
+from .db import _ClosingConnection
 
 _lock = threading.RLock()
 
@@ -13,7 +14,7 @@ _lock = threading.RLock()
 def _connect():
     path = Path(DB_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, check_same_thread=False)
+    conn = sqlite3.connect(path, check_same_thread=False, factory=_ClosingConnection)
     conn.row_factory = sqlite3.Row
     return conn
 

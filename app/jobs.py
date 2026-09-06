@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .job_context import current as job_context, JobStopped, BudgetExceeded
+from .job_context import current as job_context, JobStopped, BudgetExceeded, YieldForUser
 from .config import DB_PATH
 from .executive import run as executive_run
 from .orchestrator import is_research_task, is_current_task
@@ -257,7 +257,7 @@ def _claim_job(worker_id: str):
             conn.commit()
             return None
         row = conn.execute(
-            "SELECT * FROM jobs WHERE status='queued' AND cancel_requested=0 ORDER BY created_at ASC LIMIT 1"
+            "SELECT * FROM jobs WHERE status='queued' AND cancel_requested=0 ORDER BY CASE WHEN json_extract(metadata_json,'$.autonomous')=1 THEN 1 ELSE 0 END, created_at ASC LIMIT 1"
         ).fetchone()
         if not row:
             conn.commit()
@@ -333,9 +333,12 @@ def resume_job(job_id, extend_budget=False):
 class Execution:
     def __init__(self, job, worker_id):
         self.job_id, self.worker_id = job["id"], worker_id
+        self.local_only = bool(job.get("metadata", {}).get("autonomous"))
 
     def check(self, conn):
         row = _owned(conn, self.job_id, self.worker_id)
+        if self.local_only and conn.execute("SELECT 1 FROM jobs WHERE status='queued' AND COALESCE(json_extract(metadata_json,'$.autonomous'),0)<>1 LIMIT 1").fetchone():
+            raise YieldForUser("foreground request takes priority")
         if row["deadline_at"] and row["deadline_at"] <= _now():
             raise BudgetExceeded("job runtime budget exhausted")
         return row
@@ -422,7 +425,12 @@ async def _execute(job, worker_id):
 
     progress_token = set_reporter(reporter)
     next_heartbeat = 0.0
-    task = asyncio.create_task(executive_run(job["request"]))
+    if job.get("metadata", {}).get("autonomous"):
+        from .autonomy import run_job
+        operation = run_job(job)
+    else:
+        operation = executive_run(job["request"])
+    task = asyncio.create_task(operation)
     try:
         while not task.done():
             with closing(_connect()) as conn:
@@ -435,6 +443,14 @@ async def _execute(job, worker_id):
         result = task.result()
         outcome = "partial" if result.critique and not result.critique.get("pass", False) else "succeeded"
         _finish(job_id, worker_id, outcome, result.response, agent_run_id=result.run_id)
+    except YieldForUser:
+        with _lock, closing(_connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            _owned(conn, job_id, worker_id)
+            conn.execute("UPDATE jobs SET status='queued',worker_id=NULL,lease_expires_at=NULL,current_step='yielded_to_user' WHERE id=?",(job_id,))
+            conn.execute("UPDATE job_steps SET status='interrupted' WHERE job_id=? AND status='running'",(job_id,))
+            _event(conn,job_id,'yielded','ユーザーの依頼を優先し、自主探索を一時中断しました。')
+            conn.commit()
     except BudgetExceeded as exc:
         saved = [a for a in artifacts(job_id) if a["kind"] == "answer"]
         _finish(job_id, worker_id, "partial", result_text=saved[-1]["content"] if saved else "", error=str(exc))
@@ -476,7 +492,7 @@ async def worker_loop():
 def status():
     with _lock, closing(_connect()) as conn:
         counts = {r["status"]: int(r["c"]) for r in conn.execute("SELECT status,COUNT(*) c FROM jobs GROUP BY status").fetchall()}
-        oldest = conn.execute("SELECT created_at FROM jobs WHERE status='queued' ORDER BY created_at ASC LIMIT 1").fetchone()
+        oldest = conn.execute("SELECT created_at FROM jobs WHERE status='queued' ORDER BY CASE WHEN json_extract(metadata_json,'$.autonomous')=1 THEN 1 ELSE 0 END, created_at ASC LIMIT 1").fetchone()
     return {
         "enabled": JOB_WORKER_ENABLED,
         "counts": counts,
