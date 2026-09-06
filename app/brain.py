@@ -1,16 +1,10 @@
 import asyncio
-import json
 import re
 from datetime import datetime, timezone
 
 from .memory import recall, store_memory
 from .ollama_client import chat
-from .db import (
-    recent_memories,
-    search_external_items,
-    search_claims,
-    claim_evidence_sources,
-)
+from .db import recent_memories, search_external_items, search_claims, claim_evidence_sources
 
 SYSTEM = """あなたはユーザー専用の『第2の脳』です。
 目的は、会話をその場限りで終わらせず、過去の記憶・現在の文脈・未完了事項を統合して支援することです。
@@ -45,71 +39,93 @@ _PUBLIC_TOPIC_MARKERS = (
     "株", "ai", "openai", "google", "microsoft", "apple", "github", "cyber", "気候", "地震",
 )
 
+_ALIASES = {
+    "アメリカ": ["アメリカ", "米国", "United States", "US"],
+    "米国": ["米国", "アメリカ", "United States", "US"],
+    "イラン": ["イラン", "Iran"],
+    "中国": ["中国", "China"],
+    "ロシア": ["ロシア", "Russia"],
+    "ウクライナ": ["ウクライナ", "Ukraine"],
+    "イスラエル": ["イスラエル", "Israel"],
+    "ガザ": ["ガザ", "Gaza"],
+    "北朝鮮": ["北朝鮮", "North Korea", "DPRK"],
+    "韓国": ["韓国", "South Korea"],
+    "日本": ["日本", "Japan"],
+    "台湾": ["台湾", "Taiwan"],
+    "openai": ["OpenAI"],
+    "chatgpt": ["ChatGPT", "OpenAI"],
+    "gemini": ["Gemini", "Google"],
+    "claude": ["Claude", "Anthropic"],
+}
+
 
 def _is_plain_greeting(text: str) -> bool:
     t = text.strip().lower().replace("！", "!").replace("？", "?")
-    greetings = {
+    return t in {
         "こんにちは", "こんばんは", "おはよう", "おはようございます",
         "やあ", "どうも", "hello", "hi", "hey", "こんばんは!", "こんにちは!"
     }
-    return t in greetings
 
 
 def _is_current_public_question(text: str) -> bool:
     t = text.lower()
     has_current = any(x in t for x in _CURRENT_MARKERS)
     has_public = any(x in t for x in _PUBLIC_TOPIC_MARKERS)
-    # "現在の○○情勢" and similar questions should always use the live knowledge store.
     return has_current and (has_public or "情勢" in t or "ニュース" in t)
 
 
-def _extract_json_object(text: str):
-    try:
-        start, end = text.find("{"), text.rfind("}")
-        if start >= 0 and end > start:
-            return json.loads(text[start:end + 1])
-    except Exception:
-        pass
-    return {}
+def _fast_search_terms(user_text: str):
+    """Build search terms locally. This intentionally avoids an extra LLM call."""
+    t = user_text.lower()
+    terms = []
 
+    for needle, aliases in _ALIASES.items():
+        if needle.lower() in t:
+            terms.extend(aliases)
 
-async def _search_terms_for_question(user_text: str):
-    prompt = f"""Convert the user's current-affairs question into compact search terms for a multilingual news database.
-Return JSON only: {{"terms":[...]}}.
-Rules:
-- include important entity names in English and in the user's language when useful
-- include common aliases/acronyms (for example United States, US, U.S.)
-- do not answer the question
-- maximum 10 short terms
-Question: {user_text}
-"""
-    try:
-        raw = await chat([
-            {"role": "system", "content": "You generate database search keywords only."},
-            {"role": "user", "content": prompt},
-        ], temperature=0.0, num_predict=180, route="cloud")
-        obj = _extract_json_object(raw)
-        terms = [str(x).strip() for x in obj.get("terms", []) if str(x).strip()]
-        if terms:
-            return terms[:10]
-    except Exception as e:
-        print(f"[LIVE-RAG] keyword extraction failed: {e}")
+    # English words/acronyms are already useful DB search keys.
+    terms.extend(re.findall(r"[A-Za-z][A-Za-z0-9.\-]{1,30}", user_text))
 
-    # Safe fallback: extract meaningful chunks from the original query.
-    chunks = re.findall(r"[A-Za-z][A-Za-z0-9.\-]{1,30}|[一-龥ァ-ヶぁ-ん]{2,20}", user_text)
-    return chunks[:10]
+    # Japanese katakana compounds often contain adjacent entity names
+    # (e.g. アメリカイラン). Add 3-6 char windows so both entities can match.
+    for seq in re.findall(r"[ァ-ヶー]{4,20}", user_text):
+        for size in (6, 5, 4, 3):
+            if len(seq) >= size:
+                for i in range(0, len(seq) - size + 1):
+                    terms.append(seq[i:i + size])
+
+    # Useful kanji chunks after removing conversational boilerplate.
+    cleaned = user_text
+    for stop in ("について教えて", "について", "教えて", "現在", "最新", "今日", "情勢", "ニュース", "現状"):
+        cleaned = cleaned.replace(stop, " ")
+    terms.extend(re.findall(r"[一-龥]{2,8}", cleaned))
+
+    out = []
+    seen = set()
+    for term in terms:
+        term = term.strip()
+        key = term.lower()
+        if len(term) < 2 or key in seen:
+            continue
+        seen.add(key)
+        out.append(term)
+        if len(out) >= 12:
+            break
+    return out or [user_text[:40]]
 
 
 async def _public_intelligence_context(user_text: str):
-    terms = await _search_terms_for_question(user_text)
-    items = search_external_items(terms, limit=24)
-    claims = search_claims(terms, limit=12)
+    terms = _fast_search_terms(user_text)
+
+    # SQLite searches are fast; keep the prompt compact because prompt size is
+    # a major latency source for free cloud models.
+    items = search_external_items(terms, limit=12)
+    claims = search_claims(terms, limit=5)
 
     lines = [
         f"CURRENT UTC TIME: {datetime.now(timezone.utc).isoformat()}",
         f"SEARCH TERMS: {', '.join(terms)}",
-        "",
-        "RECENT COLLECTED SOURCES:",
+        "RECENT SOURCES:",
     ]
     source_refs = []
     for idx, item in enumerate(items, 1):
@@ -121,24 +137,24 @@ async def _public_intelligence_context(user_text: str):
             "source": item.get("source") or "",
             "time": item.get("published_at") or item.get("collected_at") or "",
         })
-        summary = (item.get("summary") or "").replace("\n", " ")[:500]
+        summary = (item.get("summary") or "").replace("\n", " ")[:280]
         lines.append(
-            f"[{ref}] time={item.get('published_at') or item.get('collected_at') or ''} "
-            f"source={item.get('source') or ''} title={item.get('title') or ''} "
-            f"url={item.get('url') or ''} summary={summary}"
+            f"[{ref}] {item.get('published_at') or item.get('collected_at') or ''} | "
+            f"{item.get('source') or ''} | {item.get('title') or ''} | {summary} | {item.get('url') or ''}"
         )
 
-    lines += ["", "FACT-CHECK CLAIMS:"]
+    if claims:
+        lines.append("FACT-CHECK CLAIMS:")
     for claim in claims:
         lines.append(
-            f"- status={claim.get('status')} confidence={float(claim.get('confidence') or 0):.2f} "
-            f"independent_sources={claim.get('independent_sources')} contradictions={claim.get('contradictions')} "
-            f"claim={claim.get('claim_text')}"
+            f"- {claim.get('status')} conf={float(claim.get('confidence') or 0):.2f} "
+            f"sources={claim.get('independent_sources')} contradictions={claim.get('contradictions')} | "
+            f"{claim.get('claim_text')}"
         )
-        for ev in claim_evidence_sources(claim.get("id"), limit=3):
+        for ev in claim_evidence_sources(claim.get("id"), limit=2):
             lines.append(
-                f"  evidence: stance={ev.get('stance')} credibility={ev.get('credibility')} "
-                f"source={ev.get('source')} time={ev.get('published_at') or ev.get('collected_at')} url={ev.get('url')}"
+                f"  evidence {ev.get('stance')} cred={ev.get('credibility')} | "
+                f"{ev.get('source')} | {ev.get('url')}"
             )
 
     return "\n".join(lines), source_refs
@@ -153,8 +169,6 @@ async def _store_conversation_later(user_text: str, response: str):
 
 
 async def answer(user_text: str):
-    # Current public-affairs questions use the live collected intelligence store.
-    # Personal memories are intentionally NOT sent to the cloud in this path.
     if _is_current_public_question(user_text):
         context, refs = await _public_intelligence_context(user_text)
         messages = [
@@ -162,25 +176,22 @@ async def answer(user_text: str):
                 "role": "system",
                 "content": (
                     "You are the current-affairs analysis module of a Second Brain. "
-                    "Use ONLY the supplied collected intelligence for claims about current events. "
-                    "Do not claim you lack real-time access: you have a local continuously collected intelligence store. "
-                    "If evidence is sparse or conflicting, say that explicitly. "
-                    "Prefer corroborated/primary evidence over social posts. "
-                    "Answer in the user's language. Cite source markers like [S1], [S2] inline. "
-                    "Do not invent events, dates, quotes, casualties, decisions, or diplomatic actions."
+                    "Use only the supplied collected intelligence for current-event claims. "
+                    "If evidence is sparse or conflicting, say so. Prefer primary/corroborated evidence. "
+                    "Answer in the user's language, concise but useful. Cite [S1], [S2] inline. "
+                    "Do not invent facts."
                 ),
             },
             {"role": "system", "content": context},
             {"role": "user", "content": user_text},
         ]
-        response = await chat(messages, temperature=0.15, num_predict=700, route="cloud")
+        # Use the fast cloud lane. The evidence was already collected locally,
+        # so search/thinking models only add latency here.
+        response = await chat(messages, temperature=0.1, num_predict=420, route="fast_cloud")
         if refs:
-            used = []
-            for ref in refs[:8]:
-                if f"[{ref['ref']}]" in response:
-                    used.append(ref)
+            used = [r for r in refs[:6] if f"[{r['ref']}]" in response]
             if not used:
-                used = refs[:5]
+                used = refs[:4]
             response += "\n\n情報源:\n" + "\n".join(
                 f"[{r['ref']}] {r['source']} — {r['title']}\n{r['url']}" for r in used
             )
@@ -189,8 +200,7 @@ async def answer(user_text: str):
 
     memories = [] if _is_plain_greeting(user_text) else await recall(user_text, top_k=6)
     memory_text = "\n".join(
-        f"- [{m['kind']}/{m['source']}] {m['content']}"
-        for m in memories
+        f"- [{m['kind']}/{m['source']}] {m['content']}" for m in memories
     ) or "（関連記憶なし）"
 
     messages = [
@@ -204,8 +214,7 @@ async def answer(user_text: str):
         },
         {"role": "user", "content": user_text},
     ]
-
-    response = await chat(messages, num_predict=320)
+    response = await chat(messages, num_predict=280)
     asyncio.create_task(_store_conversation_later(user_text, response))
     return response, memories
 
@@ -215,25 +224,11 @@ async def reflect():
     if not recent:
         return "記憶がまだないため、内省をスキップしました。"
 
-    feed = "\n".join(
-        f"[{m['kind']}/{m['source']}] {m['content']}" for m in recent
-    )
+    feed = "\n".join(f"[{m['kind']}/{m['source']}] {m['content']}" for m in recent)
     prompt = f"""最近の記憶を読み、内部用の短い内省を1つ作ってください。
-
-信頼ルール:
-- manual / user の記憶を優先する。
-- assistant の過去発言をユーザーの事実として扱わない。
-- assistant と user/manual が矛盾する場合、user/manual を優先する。
-
-次のどれかがある場合だけ価値があります:
-- 繰り返している傾向
-- 未完了の重要事項
-- 明確な矛盾
-- 成功/失敗から得られる再利用可能な教訓
-- 将来役立つ関連付け
-
-なければ『NO_REFLECTION』だけ返してください。
-ある場合は、事実と推測を分け、200文字以内で書いてください。
+manual / user の記憶を優先し、assistant の過去発言を事実扱いしないでください。
+繰り返す傾向、未完了事項、矛盾、再利用可能な教訓、将来役立つ関連付けのどれもなければ NO_REFLECTION だけ返してください。
+ある場合は事実と推測を分け、200文字以内で書いてください。
 
 最近の記憶:
 {feed}
@@ -241,7 +236,7 @@ async def reflect():
     result = await chat([
         {"role": "system", "content": "あなたは第2の脳の内省モジュールです。"},
         {"role": "user", "content": prompt},
-    ], temperature=0.3, num_predict=180)
+    ], temperature=0.3, num_predict=160)
 
     if result.strip() != "NO_REFLECTION":
         await store_memory("reflection", "dmn", result.strip(), 0.60)
