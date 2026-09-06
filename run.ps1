@@ -16,4 +16,7 @@ if (Test-Path .env) {
   }
 }
 
-& .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8765
+# Bind on all local interfaces so Docker/n8n can reach the Second Brain via
+# host.docker.internal:8765. The app is still only exposed on the user's PC
+# unless the OS/network explicitly forwards that port.
+& .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8765
