@@ -24,11 +24,23 @@ class PersistentJobTests(unittest.TestCase):
         self.assertTrue(events)
         self.assertEqual(events[0]["event_type"], "accepted")
 
-    def test_cancel_request_survives_storage(self):
+    def test_queued_cancel_becomes_final_cancelled_state(self):
         created = jobs.create_job("長い調査")
         self.assertTrue(jobs.request_cancel(created["id"]))
         loaded = jobs.get_job(created["id"])
         self.assertTrue(loaded["cancel_requested"])
+        self.assertEqual(loaded["status"], "cancelled")
+
+    def test_running_job_is_requeued_on_process_restart(self):
+        created = jobs.create_job("再起動テスト")
+        claimed = jobs._claim_job("old-worker")
+        self.assertEqual(claimed["id"], created["id"])
+        self.assertEqual(jobs.get_job(created["id"])["status"], "running")
+        jobs.init_jobs()
+        recovered = jobs.get_job(created["id"])
+        self.assertEqual(recovered["status"], "queued")
+        self.assertEqual(recovered["current_step"], "recovered_after_restart")
+        self.assertIsNone(recovered["worker_id"])
 
     def test_research_is_queued_but_small_talk_is_not(self):
         self.assertTrue(jobs.should_enqueue("海外の市場を調べて比較して"))
