@@ -6,17 +6,25 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .db import init_db, recent_memories, delete_memory, recent_external_items
+from .db import init_db, recent_memories, delete_memory, recent_external_items, recent_claims
 from .brain import answer, reflect
 from .memory import store_memory
 from .ollama_client import health
 from .whisper_service import transcribe_bytes
-from .external_collector import collect_external_information, external_collection_loop
+from .global_intelligence import (
+    collect_global_information,
+    global_collection_loop,
+    factcheck_batch,
+    factcheck_loop,
+    intelligence_status,
+)
 from .config import (
     DMN_ENABLED,
     DMN_INTERVAL_MINUTES,
     EXTERNAL_COLLECTION_ENABLED,
     EXTERNAL_COLLECTION_INTERVAL_MINUTES,
+    FACTCHECK_ENABLED,
+    FACTCHECK_INTERVAL_SECONDS,
 )
 
 
@@ -36,17 +44,15 @@ async def lifespan(app: FastAPI):
     if DMN_ENABLED:
         tasks.append(asyncio.create_task(dmn_loop()))
     if EXTERNAL_COLLECTION_ENABLED:
-        tasks.append(
-            asyncio.create_task(
-                external_collection_loop(EXTERNAL_COLLECTION_INTERVAL_MINUTES)
-            )
-        )
+        tasks.append(asyncio.create_task(global_collection_loop(EXTERNAL_COLLECTION_INTERVAL_MINUTES)))
+    if FACTCHECK_ENABLED:
+        tasks.append(asyncio.create_task(factcheck_loop(FACTCHECK_INTERVAL_SECONDS)))
     yield
     for task in tasks:
         task.cancel()
 
 
-app = FastAPI(title="Second Brain v1", lifespan=lifespan)
+app = FastAPI(title="Second Brain V1 Intelligence", lifespan=lifespan)
 STATIC = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
@@ -76,6 +82,9 @@ async def api_health():
             "models": [m.get("name") for m in tags.get("models", [])],
             "external_collection": EXTERNAL_COLLECTION_ENABLED,
             "external_collection_interval_minutes": EXTERNAL_COLLECTION_INTERVAL_MINUTES,
+            "factcheck": FACTCHECK_ENABLED,
+            "factcheck_interval_seconds": FACTCHECK_INTERVAL_SECONDS,
+            "intelligence": intelligence_status(),
         }
     except Exception as e:
         return {"ok": False, "ollama": False, "error": str(e)}
@@ -120,12 +129,27 @@ async def api_reflect():
 
 @app.post("/api/collect")
 async def api_collect():
-    return await collect_external_information()
+    return await collect_global_information()
+
+
+@app.post("/api/factcheck")
+async def api_factcheck(limit: int = 20):
+    return await factcheck_batch(min(max(limit, 1), 100))
 
 
 @app.get("/api/external/latest")
 async def api_external_latest(limit: int = 100):
-    return recent_external_items(min(max(limit, 1), 500))
+    return recent_external_items(min(max(limit, 1), 5000))
+
+
+@app.get("/api/claims/latest")
+async def api_claims_latest(limit: int = 100):
+    return recent_claims(min(max(limit, 1), 2000))
+
+
+@app.get("/api/intelligence/status")
+async def api_intelligence_status():
+    return intelligence_status()
 
 
 @app.post("/api/transcribe")
