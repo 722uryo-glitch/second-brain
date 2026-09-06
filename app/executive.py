@@ -22,6 +22,7 @@ from .db import (
     recent_agent_runs,
 )
 from .memory import recall, store_memory
+from .memory_consolidator import consolidate_user_turn
 from .ollama_client import chat
 from .orchestrator import gather_research_context, is_research_task, is_current_task
 
@@ -219,6 +220,30 @@ def _memory_context(memories: list):
     return "\n".join(lines)
 
 
+def _renumber_pack(pack: dict, start_no: int):
+    mapping = {}
+    new_refs = []
+    next_no = start_no
+    for ref in pack.get("refs", []):
+        old = str(ref.get("ref") or "")
+        new = f"S{next_no}"
+        next_no += 1
+        if old:
+            mapping[old] = new
+        copied = dict(ref)
+        copied["ref"] = new
+        new_refs.append(copied)
+
+    context = str(pack.get("context") or "")
+    if mapping:
+        context = re.sub(
+            r"\[(S\d+)\]",
+            lambda m: f"[{mapping.get(m.group(1), m.group(1))}]",
+            context,
+        )
+    return {**pack, "context": context, "refs": new_refs}, next_no
+
+
 async def _gather_research(plan: dict, user_text: str):
     if not plan.get("needs_research"):
         return [], [], True
@@ -232,19 +257,26 @@ async def _gather_research(plan: dict, user_text: str):
         except Exception as e:
             return {"query": q, "context": f"RESEARCH ERROR: {e}", "refs": [], "enough": False}
 
-    packs = await asyncio.gather(*(one(q) for q in questions))
-    refs = []
+    raw_packs = await asyncio.gather(*(one(q) for q in questions))
+    packs = []
+    all_refs = []
+    next_no = 1
     seen_urls = set()
-    for pack in packs:
+    for raw_pack in raw_packs:
+        pack, next_no = _renumber_pack(raw_pack, next_no)
+        filtered_refs = []
         for ref in pack["refs"]:
             url = ref.get("url") or ""
             if url and url in seen_urls:
                 continue
             if url:
                 seen_urls.add(url)
-            refs.append(ref)
+            filtered_refs.append(ref)
+            all_refs.append(ref)
+        pack["refs"] = filtered_refs
+        packs.append(pack)
     enough = bool(packs) and all(p.get("enough") for p in packs)
-    return packs, refs, enough
+    return packs, all_refs, enough
 
 
 def _research_context(packs: list):
@@ -414,6 +446,10 @@ async def _store_conversation_later(user_text: str, response: str, run_id=None):
         await store_memory("conversation", "assistant", response, 0.20, metadata)
     except Exception as e:
         print(f"[EXECUTIVE] memory save failed: {e}")
+    try:
+        await consolidate_user_turn(user_text, run_id)
+    except Exception as e:
+        print(f"[EXECUTIVE] consolidation failed: {e}")
 
 
 async def run(user_text: str):
@@ -485,7 +521,6 @@ async def run(user_text: str):
         )
         step_no += 1
 
-        critique = {"pass": True, "issues": [], "missing": [], "confidence": 1.0}
         review_start = _now_ms()
         critique = await _critique(user_text, plan, response, research_packs, research_enough)
         add_agent_step(
@@ -528,9 +563,7 @@ async def run(user_text: str):
         asyncio.create_task(_store_conversation_later(user_text, response, run_id))
         return ExecutiveResult(response, memories, run_id, mode, plan, critique)
     except Exception as e:
-        add_agent_step(
-            run_id, step_no, "error", "Executive failure", status="error", error=e
-        )
+        add_agent_step(run_id, step_no, "error", "Executive failure", status="error", error=e)
         finish_agent_run(run_id, "failed", error=e, metadata={"mode": mode})
         raise
 
