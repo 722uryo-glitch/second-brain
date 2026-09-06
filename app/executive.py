@@ -1,9 +1,17 @@
 import asyncio
 import json
+import hashlib
 import os
 import re
 import time
 from dataclasses import dataclass
+
+from .job_context import checkpoint, current as job_context, gather_owned
+
+
+async def _step(key, function, *args, kind="checkpoint"):
+    return await checkpoint(key, list(args), lambda: function(*args), kind)
+
 
 from .config import (
     EXECUTIVE_ENABLED,
@@ -70,6 +78,13 @@ _STRONG_RESEARCH_ASSERTIONS = (
     "不足率は", "成長率は", "シェアは", "圧倒的に", "確実に伸", "急増して", "急拡大して",
     "low competition", "undersupplied", "market size is", "growth rate is", "demand is high",
 )
+
+
+def _conversation_state():
+    context = job_context.get()
+    if context is not None and hasattr(context, "conversation_snapshot"):
+        return context.conversation_snapshot
+    return format_conversation_summary()
 
 
 def _now_ms():
@@ -154,7 +169,7 @@ async def _make_plan(user_text: str, history: list):
     if fallback["complexity"] == "simple":
         return fallback
 
-    summary = format_conversation_summary()
+    summary = _conversation_state()
     prompt = f"""Create a compact execution plan for a persistent Second Brain.
 Return one strict JSON object only.
 
@@ -269,7 +284,7 @@ async def _research_queries(queries):
             return {"query": q, "context": context, "refs": refs, "enough": enough}
         except Exception as e:
             return {"query": q, "context": f"RESEARCH ERROR: {e}", "refs": [], "enough": False}
-    return await asyncio.gather(*(one(q) for q in queries)) if queries else []
+    return await gather_owned(*(_step("query:" + hashlib.sha256(q.encode()).hexdigest()[:20], one, q, kind="research_pack") for q in queries)) if queries else []
 
 
 def _merge_research(raw_packs, packs, all_refs, next_no, seen_urls):
@@ -317,7 +332,7 @@ async def _gather_research(plan: dict, user_text: str):
         rounds += 1
         raw = await _research_queries(clean[:max(1, EXECUTIVE_MAX_RESEARCH_QUERIES)])
         next_no = _merge_research(raw, packs, all_refs, next_no, seen_urls)
-        coverage = await assess_research_coverage(user_text, plan, packs, all_refs)
+        coverage = await _step(f"coverage:{rounds}", assess_research_coverage, user_text, plan, packs, all_refs, kind="evidence_snapshot")
         if coverage.get("sufficient"):
             break
         queries = coverage.get("followup_queries") or []
@@ -374,7 +389,7 @@ async def _draft(user_text: str, history: list, plan: dict, memories: list, rese
     messages = [
         {"role": "system", "content": _answer_system(plan, research_enough, personal)},
         {"role": "system", "content": "EXECUTION PLAN:\n" + json.dumps(plan, ensure_ascii=False)},
-        {"role": "system", "content": format_conversation_summary()},
+        {"role": "system", "content": _conversation_state()},
         {"role": "system", "content": _memory_context(memories)},
         {"role": "system", "content": _research_context(research_packs, coverage)},
         *history,
@@ -505,7 +520,7 @@ Rules:
 """
     messages = [
         {"role": "system", "content": _answer_system(plan, research_enough, personal)},
-        {"role": "system", "content": format_conversation_summary()},
+        {"role": "system", "content": _conversation_state()},
         {"role": "system", "content": _memory_context(memories)},
         {"role": "system", "content": _research_context(research_packs, coverage)},
         {"role": "user", "content": prompt},
@@ -553,16 +568,16 @@ def _safe_research_failure(coverage: dict, critique: dict):
 async def _store_conversation_later(user_text: str, response: str, run_id=None):
     try:
         metadata = {"agent_run_id": run_id} if run_id else None
-        await store_memory("conversation", "user", user_text, 0.55, metadata)
-        await store_memory("conversation", "assistant", response, 0.20, metadata)
+        await _step("persist:user", store_memory, "conversation", "user", user_text, 0.55, metadata)
+        await _step("persist:assistant", store_memory, "conversation", "assistant", response, 0.20, metadata)
     except Exception as e:
         print(f"[EXECUTIVE] memory save failed: {e}")
     try:
-        await consolidate_user_turn(user_text, run_id)
+        await _step("persist:consolidation", consolidate_user_turn, user_text, run_id)
     except Exception as e:
         print(f"[EXECUTIVE] consolidation failed: {e}")
     try:
-        await maybe_update_conversation_summary(user_text, response, run_id)
+        await _step("persist:summary", maybe_update_conversation_summary, user_text, response, run_id)
     except Exception as e:
         print(f"[EXECUTIVE] context summary failed: {e}")
 
@@ -575,30 +590,38 @@ async def run(user_text: str):
             num_predict=EXECUTIVE_SIMPLE_MAX_TOKENS,
             route="fast_cloud",
         )
-        asyncio.create_task(_store_conversation_later(user_text, response))
+        if job_context.get() is not None:
+            await _store_conversation_later(user_text, response)
+        else:
+            asyncio.create_task(_store_conversation_later(user_text, response))
         return ExecutiveResult(response, [], None, "disabled", {}, {})
 
-    history = _history()
+    history = await checkpoint("history", {"request": user_text}, _history)
     if _is_greeting(user_text):
         response = await chat(
             [{"role": "system", "content": "Reply naturally and briefly in the user's language."}, *history[-4:], {"role": "user", "content": user_text}],
             num_predict=100,
             route="local",
         )
-        asyncio.create_task(_store_conversation_later(user_text, response))
+        if job_context.get() is not None:
+            await _store_conversation_later(user_text, response)
+        else:
+            asyncio.create_task(_store_conversation_later(user_text, response))
         return ExecutiveResult(response, [], None, "greeting", {}, {})
 
+    if job_context.get() is not None:
+        job_context.get().conversation_snapshot = await checkpoint("conversation_state", {}, format_conversation_summary)
     plan_start = _now_ms()
-    plan = await _make_plan(user_text, history)
+    plan = await _step("plan", _make_plan, user_text, history, kind="plan")
     mode = plan.get("mode", "work")
-    run_id = start_agent_run(user_text, plan.get("goal", ""), mode, plan)
+    run_id = await checkpoint("agent_run", {"request": user_text, "plan": plan}, lambda: start_agent_run(user_text, plan.get("goal", ""), mode, plan))
     step_no = 1
     add_agent_step(run_id, step_no, "plan", "Create execution plan", output_data=plan, duration_ms=_elapsed_ms(plan_start))
     step_no += 1
 
     try:
         memory_start = _now_ms()
-        memories = await _gather_memory(user_text, bool(plan.get("needs_memory")))
+        memories = await _step("memory", _gather_memory, user_text, bool(plan.get("needs_memory")))
         add_agent_step(
             run_id, step_no, "memory", "Retrieve relevant long-term memory",
             output_data={"count": len(memories), "ids": [m.get("id") for m in memories[:8]]},
@@ -607,7 +630,7 @@ async def run(user_text: str):
         step_no += 1
 
         research_start = _now_ms()
-        research_packs, refs, research_enough, coverage, research_rounds = await _gather_research(plan, user_text)
+        research_packs, refs, research_enough, coverage, research_rounds = await _step("research", _gather_research, plan, user_text, kind="research_pack")
         add_agent_step(
             run_id, step_no, "research", "Iterative evidence collection and gap analysis",
             input_data={"initial_queries": plan.get("subquestions", []), "required_evidence": plan.get("required_evidence", [])},
@@ -623,7 +646,7 @@ async def run(user_text: str):
         step_no += 1
 
         draft_start = _now_ms()
-        response = await _draft(user_text, history, plan, memories, research_packs, research_enough, coverage)
+        response = await _step("draft", _draft, user_text, history, plan, memories, research_packs, research_enough, coverage, kind="draft")
         add_agent_step(
             run_id, step_no, "draft", "Produce answer or deliverable",
             output_data={"characters": len(response), "route": _draft_route(plan)},
@@ -632,7 +655,7 @@ async def run(user_text: str):
         step_no += 1
 
         review_start = _now_ms()
-        critique = await _critique(user_text, plan, response, research_packs, research_enough, refs, coverage)
+        critique = await _step("review:0", _critique, user_text, plan, response, research_packs, research_enough, refs, coverage, kind="critique")
         add_agent_step(
             run_id, step_no, "review", "Audit answer against goal and evidence",
             output_data=critique,
@@ -643,7 +666,7 @@ async def run(user_text: str):
         revisions = 0
         while not critique.get("pass", True) and revisions < max(0, EXECUTIVE_MAX_REVISIONS):
             revise_start = _now_ms()
-            response = await _revise(user_text, plan, response, critique, memories, research_packs, research_enough, coverage)
+            response = await _step(f"revise:{revisions+1}", _revise, user_text, plan, response, critique, memories, research_packs, research_enough, coverage, kind="revised_draft")
             revisions += 1
             add_agent_step(
                 run_id, step_no, "revise", "Repair failed draft",
@@ -652,13 +675,14 @@ async def run(user_text: str):
                 duration_ms=_elapsed_ms(revise_start),
             )
             step_no += 1
-            critique = await _critique(user_text, plan, response, research_packs, research_enough, refs, coverage)
+            critique = await _step(f"review:{revisions}", _critique, user_text, plan, response, research_packs, research_enough, refs, coverage, kind="critique")
 
         if plan.get("needs_research") and not critique.get("pass", False):
             response = _safe_research_failure(coverage, critique)
         else:
             response = _append_sources(response, refs)
 
+        await checkpoint("final", {"response": response, "critique": critique}, lambda: response, "answer")
         finish_agent_run(
             run_id,
             "completed",
@@ -674,7 +698,10 @@ async def run(user_text: str):
                 "draft_route": _draft_route(plan),
             },
         )
-        asyncio.create_task(_store_conversation_later(user_text, response, run_id))
+        if job_context.get() is not None:
+            await _store_conversation_later(user_text, response, run_id)
+        else:
+            asyncio.create_task(_store_conversation_later(user_text, response, run_id))
         return ExecutiveResult(response, memories, run_id, mode, plan, critique)
     except Exception as e:
         add_agent_step(run_id, step_no, "error", "Executive failure", status="error", error=e)

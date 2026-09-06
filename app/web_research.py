@@ -6,6 +6,8 @@ from urllib.parse import quote, urlparse, urlunparse
 
 import httpx
 
+from .job_context import reserve_call, gather_owned
+
 from .db import add_external_item
 from .external_collector import _parse_feed
 
@@ -69,6 +71,7 @@ async def _request_with_retry(client, method, url, **kwargs):
     attempts = max(1, RESEARCH_HTTP_RETRIES + 1)
     for attempt in range(attempts):
         try:
+            reserve_call(retry=attempt > 0)
             r = await client.request(method, url, **kwargs)
             if r.status_code in {408, 425, 429, 500, 502, 503, 504} and attempt + 1 < attempts:
                 await asyncio.sleep(min(2.5, 0.5 * (2 ** attempt)))
@@ -77,6 +80,9 @@ async def _request_with_retry(client, method, url, **kwargs):
             return r
         except Exception as e:
             last = e
+            transient = isinstance(e, (httpx.TimeoutException, httpx.TransportError)) or (isinstance(e, httpx.HTTPStatusError) and e.response.status_code in {408,425,429,500,502,503,504})
+            if not transient:
+                raise
             if attempt + 1 < attempts:
                 await asyncio.sleep(min(2.5, 0.5 * (2 ** attempt)))
     raise last or RuntimeError("request failed")
@@ -271,14 +277,12 @@ async def research_web(query: str, current=False, limit=None):
     """Search general web + news and fetch the top direct pages for evidence."""
     limit = int(limit or RESEARCH_WEB_LIMIT)
     time_range = "month" if current else None
-    general_task = asyncio.create_task(searxng_search(query, limit=limit, time_range=time_range))
-    news_task = asyncio.create_task(google_news_search(query, limit=min(8, limit)))
-    general, news = await asyncio.gather(general_task, news_task)
+    general, news = await gather_owned(searxng_search(query, limit=limit, time_range=time_range), google_news_search(query, limit=min(8, limit)))
 
     rows = _dedupe(general + news)
     fetch_candidates = [r for r in rows if r.get("provider") == "searxng"][:max(0, RESEARCH_FETCH_TOP_K)]
     if fetch_candidates:
-        fetched = await asyncio.gather(*(fetch_result_body(r) for r in fetch_candidates))
+        fetched = await gather_owned(*(fetch_result_body(r) for r in fetch_candidates))
         by_original = {(r.get("original_url") or r.get("url")): r for r in fetched}
         merged = []
         for row in rows:
