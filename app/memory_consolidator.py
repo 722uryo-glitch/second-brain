@@ -2,7 +2,7 @@ import json
 import re
 
 from .db import recent_memories
-from .memory import store_memory
+from .memory import store_memory, find_near_duplicate
 from .ollama_client import chat
 
 _ALLOWED_KINDS = {"preference", "user_fact", "decision", "task", "goal"}
@@ -28,26 +28,20 @@ def _normalize(text: str):
     return re.sub(r"\s+", " ", str(text or "").strip()).lower()
 
 
-def _already_exists(content: str):
+def _exact_exists(content: str):
     needle = _normalize(content)
     if not needle:
         return True
-    for row in recent_memories(300):
+    for row in recent_memories(500):
         if row.get("source") not in {"user", "manual"}:
             continue
-        existing = _normalize(row.get("content"))
-        if existing == needle:
+        if _normalize(row.get("content")) == needle:
             return True
     return False
 
 
 async def consolidate_user_turn(user_text: str, run_id=None):
-    """Extract durable user-authored memory after a turn without slowing the reply.
-
-    This runs on local Ollama only so personal information is not sent to the
-    cloud merely for memory extraction. It never promotes assistant statements
-    into user facts.
-    """
+    """Extract durable user-authored memory without promoting assistant guesses."""
     text = str(user_text or "").strip()
     if len(text) < 4:
         return {"stored": 0, "items": []}
@@ -63,7 +57,7 @@ Rules:
 - Do NOT infer hidden traits, identity, health, politics, religion, sexuality, or other sensitive attributes.
 - Do NOT turn a question, hypothetical, example, or assistant claim into a user fact.
 - Rewrite content so it can stand alone later, but preserve the user's meaning.
-- Use preference for likes/dislikes; decision for chosen approaches; task for concrete unfinished actions; goal for longer-term desired outcomes.
+- preference=likes/dislikes; decision=chosen approach; task=unfinished concrete action; goal=longer-term desired outcome.
 - importance: 0.55 ordinary, 0.70 important, 0.85 explicitly emphasized/long-term.
 - If nothing durable exists, return [].
 
@@ -91,8 +85,22 @@ USER MESSAGE:
             continue
         kind = str(item.get("kind") or "").strip()
         content = str(item.get("content") or "").strip()
-        if kind not in _ALLOWED_KINDS or len(content) < 3 or _already_exists(content):
+        if kind not in _ALLOWED_KINDS or len(content) < 3 or _exact_exists(content):
             continue
+
+        # Avoid paraphrase duplicates that would otherwise crowd retrieval.
+        try:
+            duplicate = await find_near_duplicate(
+                content,
+                kinds={kind},
+                sources={"user", "manual"},
+                threshold=0.90,
+            )
+            if duplicate:
+                continue
+        except Exception as e:
+            print(f"[MEMORY] duplicate check failed; continuing safely: {e}")
+
         try:
             importance = float(item.get("importance", 0.6))
         except Exception:
