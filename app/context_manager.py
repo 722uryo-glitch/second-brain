@@ -1,6 +1,7 @@
 import json
 import re
 
+from .config import UNOROUTER_PRIVATE_CHAT
 from .ollama_client import chat
 from .runtime_state import get_state, set_state
 
@@ -14,11 +15,23 @@ def get_conversation_summary():
     return state
 
 
-def format_conversation_summary():
+def format_conversation_summary(allow_private=False):
+    """Render rolling context only when it is safe for the intended prompt.
+
+    The executive's cloud lanes call this with the default. Personal rolling
+    state therefore never rides along merely because a public/work request uses
+    UnoRouter. Explicit cloud-private opt-in can expose it.
+    """
+    if not (allow_private or UNOROUTER_PRIVATE_CHAT):
+        return "ROLLING CONVERSATION CONTEXT: withheld from cloud/private prompt by policy"
     state = get_conversation_summary()
     if not state:
         return "ROLLING CONVERSATION CONTEXT: none"
     return "ROLLING CONVERSATION CONTEXT:\n" + json.dumps(state, ensure_ascii=False)
+
+
+def format_private_conversation_summary():
+    return format_conversation_summary(allow_private=True)
 
 
 def _extract_json(text: str):
@@ -38,19 +51,17 @@ def _extract_json(text: str):
 
 
 async def maybe_update_conversation_summary(user_text: str, assistant_text: str, run_id=None):
-    """Refresh durable conversation context periodically, off the response path.
-
-    Recent raw turns remain the short-term context. This compact state preserves
-    older goals, decisions and unresolved threads after those turns fall out of
-    the prompt window.
-    """
-    if run_id is not None:
-        try:
-            # Updating every four completed runs avoids constant local-model load.
-            if int(run_id) % 4 != 0:
-                return {"updated": False, "reason": "interval"}
-        except Exception:
-            pass
+    """Refresh durable conversation context periodically, off the response path."""
+    # Greeting/disabled lanes have no durable executive run and should not wake a
+    # local model just to rewrite the rolling state.
+    if run_id is None:
+        return {"updated": False, "reason": "no_agent_run"}
+    try:
+        # Updating every four completed runs avoids constant local-model load.
+        if int(run_id) % 4 != 0:
+            return {"updated": False, "reason": "interval"}
+    except Exception:
+        return {"updated": False, "reason": "invalid_run_id"}
 
     previous = get_conversation_summary()
     prompt = f"""Update the rolling conversation state using ONLY the new USER and ASSISTANT turn.
