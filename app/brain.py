@@ -1,4 +1,5 @@
 import asyncio
+import re
 
 from .memory import recall, store_memory
 from .ollama_client import chat
@@ -16,19 +17,6 @@ SYSTEM = """あなたはユーザー専用の『第2の脳』です。
 - 質問に答えるだけでなく、依頼なら実行可能な形まで具体化する。
 - 迷った場合は最も妥当な選択肢を選び、その選択を短く明示して進める。
 - ありきたりな一般論だけで終わらせない。
-
-記憶の信頼順位:
-1. manual
-2. user 由来の preference / user_fact / decision / task
-3. user の conversation / whisper transcript
-4. reflection / dmn
-5. assistant の過去発言
-
-記憶の原則:
-- 関係する記憶だけ使う。
-- assistant の過去発言は事実として扱わない。
-- user/manual と assistant が矛盾する場合は user/manual を優先する。
-- 記憶にないことを『覚えている』とは言わない。
 """
 
 _PERSONAL_MARKERS = (
@@ -44,10 +32,7 @@ _LONG_FORM_MARKERS = (
 
 def _is_plain_greeting(text: str) -> bool:
     t = text.strip().lower().replace("！", "!").replace("？", "?")
-    return t in {
-        "こんにちは", "こんばんは", "おはよう", "おはようございます",
-        "やあ", "どうも", "hello", "hi", "hey", "こんばんは!", "こんにちは!"
-    }
+    return t in {"こんにちは", "こんばんは", "おはよう", "おはようございます", "やあ", "どうも", "hello", "hi", "hey", "こんばんは!", "こんにちは!"}
 
 
 def _looks_personal(text: str) -> bool:
@@ -71,6 +56,49 @@ def _short_history(limit=8):
     return messages
 
 
+def _valid_ref_count(text: str, refs) -> int:
+    valid = {r.get("ref") for r in refs}
+    found = set(re.findall(r"\[(S\d+)\]", text or ""))
+    return len(found & valid)
+
+
+async def _research_brief(user_text: str, context: str, refs, enough: bool):
+    """Create an evidence-constrained analyst brief before any final writing.
+
+    This deliberately uses the verify/reasoning lane rather than the fast chat lane.
+    The final writer is not allowed to invent a niche that the analyst could not support.
+    """
+    prompt = f"""USER REQUEST:\n{user_text}\n\nSECOND BRAIN EVIDENCE:\n{context}\n\nCreate a compact research brief in Japanese.
+
+Hard rules:
+- Every material factual claim about demand, competition/supply, market trend, or user need MUST cite one or more source ids like [S1].
+- Do not use general world knowledge to fill evidence gaps.
+- Do not say a niche has low competition unless the evidence actually supports low competition/supply.
+- If the evidence only supports demand but not low supply, write that explicitly.
+- Reject internally contradictory candidates.
+- For an affiliate-niche task, evaluate at least 3 candidate angles if evidence permits, then pick one only if BOTH demand and a plausible supply/competition gap are evidenced.
+- If no candidate meets that bar, output exactly: NO_EVIDENCE_BACKED_NICHE
+- Do not write the final article yet.
+"""
+    brief = await chat(
+        [
+            {"role": "system", "content": "You are the evidence-auditing analyst inside a persistent Second Brain. Be skeptical and citation-bound."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.05,
+        num_predict=900,
+        route="cloud",
+    )
+    if brief.strip() == "NO_EVIDENCE_BACKED_NICHE":
+        return brief
+    # If the model produced an uncited 'research' brief, treat it as invalid rather than laundering hallucination.
+    if refs and _valid_ref_count(brief, refs) < 2:
+        return "NO_EVIDENCE_BACKED_NICHE"
+    if not enough:
+        return "NO_EVIDENCE_BACKED_NICHE"
+    return brief
+
+
 async def _store_conversation_later(user_text: str, response: str):
     try:
         await store_memory("conversation", "user", user_text, 0.55)
@@ -83,45 +111,49 @@ async def answer(user_text: str):
     history = _short_history(8)
     long_form = _is_long_form_task(user_text)
 
-    # 1) Research/current-affairs lane: this is the actual Second Brain path.
-    # It consults the persistent intelligence archive, fact-checked claims and
-    # one on-demand public research request before the model writes anything.
+    # 1) Research/current-affairs lane: always pass through the actual Second Brain.
     if is_research_task(user_text) or is_current_task(user_text):
         context, refs, enough = await gather_research_context(user_text, on_demand=True)
+        brief = await _research_brief(user_text, context, refs, enough)
+
+        if brief.strip() == "NO_EVIDENCE_BACKED_NICHE" and is_research_task(user_text):
+            response = (
+                "第2の脳で調査しましたが、現時点の取得データだけでは『需要がある』と『供給・競合が少ない』を同時に裏付けられる候補を確認できませんでした。\n\n"
+                "ここでテーマをでっち上げて記事を書くのはやめます。今の第2の脳はニュース・SNS・GitHub・論文などの外部情報は大量に持っていますが、"
+                "検索ボリュームやSERP競合数、広告単価、アフィリエイト案件数まで直接測れていないため、『需要×供給ギャップ』判定にはまだデータが足りません。\n\n"
+                "次に必要なのは、市場調査用のデータ源を第2の脳へ追加してから記事生成へ進むことです。"
+            )
+            asyncio.create_task(_store_conversation_later(user_text, response))
+            return response, []
+
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "You are the research/execution module of a persistent Second Brain. "
-                    "The evidence pack below comes from the Second Brain's stored external intelligence, "
-                    "fact-check database, and on-demand public research. Use it before reasoning from general knowledge. "
-                    "Do not pretend that market demand, low competition, supply gaps, trends, or current events were researched "
-                    "unless the evidence pack supports them. If evidence is insufficient, say exactly what is unproven. "
-                    "When the user asks for an article after research, first choose the strongest evidence-backed angle and then "
-                    "write the complete deliverable. Cite [S1], [S2] inline for factual claims when useful. "
-                    "Do not ask the user to choose a topic when they delegated that choice. Answer in the user's language."
+                    "You are the execution/writing module of a persistent Second Brain. "
+                    "The ANALYST BRIEF was produced by an evidence-auditing stage. Treat it as the only allowed basis for researched market claims. "
+                    "Do not invent demand, low competition, supply gaps, trends, prices, popularity, or market size. "
+                    "If the brief says a point is unproven, preserve that uncertainty. "
+                    "When asked for an article, write the complete useful article, but do not turn a hypothesis into a fact. "
+                    "Keep source ids [S1], [S2] attached to factual claims. Answer in the user's language."
                 ),
             },
-            {"role": "system", "content": context},
+            {"role": "system", "content": "ANALYST BRIEF:\n" + brief},
             *history,
             {"role": "user", "content": user_text},
         ]
         response = await chat(
             messages,
-            temperature=0.18,
+            temperature=0.15,
             num_predict=1800 if long_form else 700,
             route="fast_cloud",
         )
 
-        if refs:
-            used = [r for r in refs[:10] if f"[{r['ref']}]" in response]
-            if used:
-                response += "\n\n参照した情報源:\n" + "\n".join(
-                    f"[{r['ref']}] {r['source']} — {r['title']}\n{r['url']}" for r in used[:6]
-                )
-        if not enough:
-            response += "\n\n※ 第2の脳内の根拠が十分でない部分は、断定ではなく仮説として扱っています。"
-
+        used = [r for r in refs[:20] if f"[{r['ref']}]" in response]
+        if used:
+            response += "\n\n参照した情報源:\n" + "\n".join(
+                f"[{r['ref']}] {r['source']} — {r['title']}\n{r['url']}" for r in used[:8]
+            )
         asyncio.create_task(_store_conversation_later(user_text, response))
         return response, []
 
@@ -140,30 +172,17 @@ async def answer(user_text: str):
             *history,
             {"role": "user", "content": user_text},
         ]
-        response = await chat(
-            messages,
-            temperature=0.25,
-            num_predict=1800 if long_form else 520,
-            route="fast_cloud",
-        )
+        response = await chat(messages, temperature=0.25, num_predict=1800 if long_form else 520, route="fast_cloud")
         asyncio.create_task(_store_conversation_later(user_text, response))
         return response, []
 
     # 3) Personal-memory lane: semantic long-term memory stays local.
     memories = [] if _is_plain_greeting(user_text) else await recall(user_text, top_k=6)
-    memory_text = "\n".join(
-        f"- [{m['kind']}/{m['source']}] {m['content']}" for m in memories
-    ) or "（関連記憶なし）"
+    memory_text = "\n".join(f"- [{m['kind']}/{m['source']}] {m['content']}" for m in memories) or "（関連記憶なし）"
     messages = [
         {"role": "system", "content": SYSTEM},
         *history,
-        {
-            "role": "system",
-            "content": (
-                "以下は第2の脳の長期記憶検索結果です。現在の発言に直接関係するものだけ使ってください。"
-                "関係が薄いものは完全に無視してください。\n" + memory_text
-            ),
-        },
+        {"role": "system", "content": "以下は第2の脳の長期記憶検索結果です。現在の発言に直接関係するものだけ使ってください。関係が薄いものは完全に無視してください。\n" + memory_text},
         {"role": "user", "content": user_text},
     ]
     response = await chat(messages, num_predict=360, route="local")
@@ -181,8 +200,7 @@ manual / user の記憶を優先し、assistant の過去発言を事実扱い�
 繰り返す傾向、未完了事項、矛盾、再利用可能な教訓、将来役立つ関連付けのどれもなければ NO_REFLECTION だけ返してください。
 ある場合は事実と推測を分け、200文字以内で書いてください。
 
-最近の記憶:
-{feed}
+最近の記憶:\n{feed}
 """
     result = await chat([
         {"role": "system", "content": "あなたは第2の脳の内省モジュールです。"},
