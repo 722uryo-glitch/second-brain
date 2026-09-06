@@ -32,6 +32,19 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_memories_kind ON memories(kind);
+
+            CREATE TABLE IF NOT EXISTS external_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                collected_at TEXT NOT NULL,
+                source TEXT NOT NULL,
+                title TEXT NOT NULL,
+                url TEXT NOT NULL UNIQUE,
+                published_at TEXT,
+                summary TEXT,
+                metadata_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_external_items_collected_at ON external_items(collected_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_external_items_source ON external_items(source);
             """
         )
         conn.commit()
@@ -85,3 +98,34 @@ def delete_memory(memory_id: int):
     with _lock, _connect() as conn:
         conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
         conn.commit()
+
+
+def add_external_item(source, title, url, published_at=None, summary=None, metadata=None):
+    now = datetime.now(timezone.utc).isoformat()
+    with _lock, _connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO external_items(
+                collected_at, source, title, url, published_at, summary, metadata_json
+            ) VALUES(?,?,?,?,?,?,?)
+            """,
+            (
+                now,
+                source,
+                title,
+                url,
+                published_at,
+                summary,
+                json.dumps(metadata or {}, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def recent_external_items(limit=100):
+    with _lock, _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM external_items ORDER BY id DESC LIMIT ?", (int(limit),)
+        ).fetchall()
+    return [dict(r) for r in rows]
