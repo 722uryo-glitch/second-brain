@@ -36,6 +36,10 @@ def _write(path: Path, text: str):
 
 
 def export_to_obsidian():
+    from .knowledge import init_knowledge
+    from .knowledge_vault import export_knowledge
+    init_knowledge()
+    export_knowledge()
     root = _vault()
     generated = datetime.now(timezone.utc).isoformat()
     claims = recent_claims(OBSIDIAN_MAX_CLAIMS)

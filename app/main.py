@@ -15,6 +15,8 @@ from .db import (
     recent_agent_runs,
 )
 from .brain import answer_detailed, reflect
+from . import knowledge, autonomy
+from .knowledge_vault import export_knowledge
 from .memory import store_memory
 from .ollama_client import health, router_status
 from .executive import status as executive_status
@@ -90,6 +92,7 @@ async def lifespan(app: FastAPI):
     init_v1_storage()
     init_runtime_state()
     init_jobs()
+    knowledge.init_knowledge()
     try:
         init_search_index()
     except Exception as e:
@@ -98,6 +101,7 @@ async def lifespan(app: FastAPI):
     tasks = []
     if JOB_WORKER_ENABLED:
         tasks.append(asyncio.create_task(worker_loop()))
+        tasks.append(asyncio.create_task(autonomy.loop()))
     if DMN_ENABLED:
         tasks.append(asyncio.create_task(dmn_loop()))
     if EXTERNAL_COLLECTION_ENABLED:
@@ -191,6 +195,55 @@ async def api_research_status():
         "retrieval": retrieval_status(),
         "runtime_state": runtime_state_status(),
     }
+
+
+class KnowledgeSettingsIn(BaseModel):
+    enabled: bool | None = None
+    topics: list[str] | None = None
+
+
+@app.get("/api/knowledge")
+async def api_knowledge():
+    return knowledge.snapshot()
+
+
+@app.post("/api/knowledge/settings")
+async def api_knowledge_settings(data: KnowledgeSettingsIn):
+    topics=None if data.topics is None else list(dict.fromkeys(t.strip()[:100] for t in data.topics if t.strip()))[:12]
+    settings=knowledge.configure(enabled=data.enabled,topics=topics)
+    if data.enabled is False:
+        # Cancel only autonomous jobs, never a user's research request.
+        for job in list_jobs(1000):
+            if job.get('metadata',{}).get('autonomous') and job['status'] in {'queued','running'}:
+                request_cancel(job['id'])
+                from . import db
+                with db._connect() as conn:
+                    conn.execute("UPDATE knowledge_questions SET state='paused' WHERE job_id=? AND state='queued'",(job['id'],))
+                    conn.execute("UPDATE knowledge_sources SET state='paused' WHERE job_id=? AND state='queued'",(job['id'],))
+    return settings
+
+
+@app.post("/api/knowledge/cycle")
+async def api_knowledge_cycle():
+    return autonomy.cycle()
+
+
+@app.post("/api/knowledge/export")
+async def api_knowledge_export():
+    return await asyncio.to_thread(export_knowledge)
+
+
+@app.post("/api/knowledge/workflows/{recipe_id}/repeat")
+async def api_repeat_workflow(recipe_id: int):
+    from . import db
+    with db._connect() as conn:
+        recipe=conn.execute('SELECT * FROM knowledge_recipes WHERE id=?',(recipe_id,)).fetchone()
+    if not recipe:
+        raise HTTPException(status_code=404,detail='workflow not found')
+    qid=knowledge.add_question(recipe['query'],'保存した調査条件で再確認する',recipe['topic'])
+    with db._connect() as conn:
+        conn.execute("UPDATE knowledge_questions SET state='pending',attempts=0,next_at=? WHERE id=? AND state<>'queued'",(knowledge.now(),qid))
+    return autonomy.cycle()
 
 
 @app.get("/api/jobs/status")

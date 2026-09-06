@@ -23,6 +23,7 @@ from .db import (
     add_claim_evidence, recent_claims,
 )
 from .external_collector import _parse_feed
+from .web_research import _extract_main_text
 from .ollama_client import chat
 from .v1_storage import (
     record_source_result, start_collection_run, finish_collection_run,
@@ -89,7 +90,7 @@ async def _ingest_feed(client, source, url, metadata, sem):
                 md.update({"feed_url": url, "source_type": metadata.get("source_type", "rss")})
                 if add_external_item(source, item["title"], item["url"], item.get("published_at"), item.get("summary"), md):
                     new += 1
-            return _result(source, md.get("source_type", "rss"), len(items), new)
+            return _result(source, metadata.get("source_type", "rss"), len(items), new)
         except Exception as e:
             return _result(source, metadata.get("source_type", "rss"), error=e)
 
@@ -295,9 +296,10 @@ async def fetch_document_bodies(client=None, limit=None):
                 if r.status_code >= 400:
                     save_document(item["id"], str(r.url), "", "error", r.status_code, f"HTTP {r.status_code}")
                     return False
-                text = _html_to_text(r.text) if ("html" in ctype or not ctype) else (item.get("summary") or "")
+                text = _extract_main_text(r.text, str(r.url)) if ("html" in ctype or not ctype) else ""
                 if len(text) < 80:
-                    text = (item.get("summary") or item.get("title") or "") + " " + text
+                    save_document(item["id"], str(r.url), "", "error", r.status_code, "readable article body not found")
+                    return False
                 save_document(item["id"], str(r.url), text[:50000], "ok", r.status_code)
                 return True
             except Exception as e:
@@ -379,59 +381,29 @@ def _adaptive_factcheck_limit(requested=None):
 
 
 async def factcheck_batch(limit=None):
-    batch_limit = _adaptive_factcheck_limit(limit)
-    items = unprocessed_external_items(batch_limit)
-    if not items:
-        return {"processed": 0, "claims": 0, "backlog": 0}
-    compact = []
-    for i in items:
-        doc = document_for_item(i["id"])
-        compact.append({
-            "id": i["id"], "source": i["source"], "url": i["url"], "title": i["title"],
-            "summary": (i.get("summary") or "")[:700],
-            "body": ((doc or {}).get("body_text") or "")[:1400],
-        })
-    prompt = """You normalize multilingual evidence for a fact-check engine. Return ONE strict JSON array and nothing else.
-For every input object return: {id, claim_key, canonical_claim, stance, language, checkability}.
-Rules:
-- canonical_claim: concise factual proposition in English; preserve dates, numbers, entities and uncertainty.
-- claim_key: stable lowercase snake_case identity for the SAME underlying real-world proposition across languages and publishers.
-- stance: supports or contradicts the affirmative canonical proposition.
-- checkability: factual, event, opinion, or unclear.
-- Never decide truth from one source. Never invent missing facts.
-- If social text is rumor/speculation, preserve that uncertainty in canonical_claim.
-Evidence items:\n""" + json.dumps(compact, ensure_ascii=False)
-    try:
-        raw = await chat([
-            {"role": "system", "content": "You are a multilingual evidence normalizer. Return valid JSON only."},
-            {"role": "user", "content": prompt},
-        ], temperature=0.05, num_predict=2600)
-        normalized = _extract_json(raw)
-    except Exception:
-        normalized = []
-    by_id = {int(x.get("id")): x for x in normalized if str(x.get("id", "")).isdigit()}
-    claims = 0
-    for item in items:
-        n = by_id.get(int(item["id"])) or {}
-        canonical = (n.get("canonical_claim") or item["title"]).strip()
-        key = (n.get("claim_key") or hashlib.sha1(canonical.lower().encode("utf-8")).hexdigest()).strip().lower()
-        key = re.sub(r"[^a-z0-9_:-]+", "_", key)[:220]
-        stance = n.get("stance") if n.get("stance") in {"supports", "contradicts"} else "supports"
-        try:
-            md = json.loads(item.get("metadata_json") or "{}")
-        except Exception:
-            md = {}
-        source_type = md.get("source_type", "unknown")
-        doc = document_for_item(item["id"])
-        final_url = (doc or {}).get("final_url") or item["url"]
-        domain = md.get("domain") or _domain(final_url)
-        claim_id = upsert_claim(key, canonical, {
-            "language": n.get("language"), "first_source": item["source"],
-            "checkability": n.get("checkability"),
-        })
-        add_claim_evidence(claim_id, item["id"], domain, source_type, stance, _credibility(domain, source_type))
-        claims += 1
-    return {"processed": len(items), "claims": claims, "backlog": queue_metrics().get("factcheck_backlog", 0), "batch_size": batch_limit}
+    """Project quote-backed readings only; failed decoding never becomes support evidence."""
+    from . import db, knowledge as k
+    k.init_knowledge()
+    with db._connect() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS knowledge_claim_projection (note_id INTEGER,version INTEGER,PRIMARY KEY(note_id,version))")
+        notes=[k.decode(r) for r in conn.execute("""SELECT n.* FROM knowledge_notes n
+          LEFT JOIN knowledge_claim_projection p ON p.note_id=n.id AND p.version=n.version
+          WHERE n.kind='source' AND n.origin LIKE 'external:%' AND p.note_id IS NULL
+          ORDER BY n.id LIMIT ?""",(int(limit or 5),))]
+    count=0
+    for note in notes:
+        external_id=int(note['origin'].split(':',1)[1])
+        for claim in note['claims']:
+            if claim.get('kind')!='fact' or not claim.get('quote'):
+                continue
+            key=k.digest(claim['text'].strip().casefold())
+            cid=upsert_claim(key,claim['text'],{'normalization':'quoted_reading','source_quote':claim['quote'],
+                                             'note_id':note['id'],'note_version':note['version']})
+            add_claim_evidence(cid,external_id,_domain(note['source_url']),'source_statement','supports',0.5)
+            count+=1
+        with db._connect() as conn:
+            conn.execute('INSERT OR IGNORE INTO knowledge_claim_projection VALUES(?,?)',(note['id'],note['version']))
+    return {'processed':len(notes),'claims':count,'backlog':queue_metrics().get('factcheck_backlog',0),'batch_size':len(notes)}
 
 
 async def global_collection_loop(interval_minutes: int):
@@ -461,7 +433,7 @@ async def factcheck_loop(interval_seconds: int):
         except Exception as e:
             print(f"[FACTCHECK] failed: {e}")
         backlog = queue_metrics().get("factcheck_backlog", 0)
-        delay = 1 if backlog > 1000 else max(3, interval_seconds)
+        delay = max(30, interval_seconds)
         await asyncio.sleep(delay)
 
 

@@ -254,6 +254,7 @@ async def chat(messages, model=None, temperature=0.4, num_predict=384, route="au
         UNOROUTER_ENABLED
         and bool(UNOROUTER_API_KEY)
         and route != "local"
+        and not getattr(job_context.get(), "local_only", False)
         and (public_intelligence or UNOROUTER_PRIVATE_CHAT or route in {"cloud", "fast_cloud", "verify", "reasoning"})
     )
 

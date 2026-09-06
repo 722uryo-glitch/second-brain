@@ -10,6 +10,10 @@ class JobStopped(asyncio.CancelledError):
     """Must bypass broad Exception fallback handlers in research/model code."""
 
 
+class YieldForUser(JobStopped):
+    pass
+
+
 class BudgetExceeded(JobStopped):
     pass
 
