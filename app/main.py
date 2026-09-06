@@ -21,6 +21,19 @@ from .executive import status as executive_status
 from .retrieval import init_search_index, retrieval_status
 from .runtime_state import init_runtime_state, runtime_state_status
 from .orchestrator import orchestrator_status
+from .jobs import (
+    JOB_WORKER_ENABLED,
+    init_jobs,
+    should_enqueue,
+    create_job,
+    get_job,
+    list_jobs,
+    job_events,
+    artifacts as job_artifacts,
+    request_cancel,
+    worker_loop,
+    status as jobs_status,
+)
 from .whisper_service import transcribe_bytes
 from .global_intelligence import (
     collect_global_information,
@@ -74,12 +87,15 @@ async def lifespan(app: FastAPI):
     init_db()
     init_v1_storage()
     init_runtime_state()
+    init_jobs()
     try:
         init_search_index()
     except Exception as e:
         print(f"[RETRIEVAL] FTS initialization failed; LIKE fallback remains available: {e}")
 
     tasks = []
+    if JOB_WORKER_ENABLED:
+        tasks.append(asyncio.create_task(worker_loop()))
     if DMN_ENABLED:
         tasks.append(asyncio.create_task(dmn_loop()))
     if EXTERNAL_COLLECTION_ENABLED:
@@ -95,13 +111,19 @@ async def lifespan(app: FastAPI):
         task.cancel()
 
 
-app = FastAPI(title="Second Brain V2 Executive Intelligence", lifespan=lifespan)
+app = FastAPI(title="Second Brain V3 Persistent Jobs", lifespan=lifespan)
 STATIC = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
 class ChatIn(BaseModel):
     message: str
+    force_sync: bool = False
+
+
+class JobIn(BaseModel):
+    message: str
+    max_runtime_seconds: int | None = None
 
 
 class MemoryIn(BaseModel):
@@ -121,11 +143,12 @@ async def api_health():
         tags = await health()
         return {
             "ok": True,
-            "version": "V2-executive-research",
+            "version": "V3-persistent-jobs",
             "ollama": True,
             "models": [m.get("name") for m in tags.get("models", [])],
             "ai_router": router_status(),
             "executive": executive_status(),
+            "jobs": jobs_status(),
             "retrieval": retrieval_status(),
             "runtime_state": runtime_state_status(),
             "research": orchestrator_status(),
@@ -167,11 +190,78 @@ async def api_research_status():
     }
 
 
+@app.get("/api/jobs/status")
+async def api_jobs_status():
+    return jobs_status()
+
+
+@app.get("/api/jobs")
+async def api_jobs(limit: int = 30):
+    return list_jobs(min(max(limit, 1), 200))
+
+
+@app.post("/api/jobs")
+async def api_create_job(data: JobIn):
+    message = data.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+    runtime = None
+    if data.max_runtime_seconds is not None:
+        runtime = min(max(int(data.max_runtime_seconds), 30), 7200)
+    job = create_job(message, max_runtime_seconds=runtime, metadata={"created_via": "api"})
+    return {"accepted": True, "job": job}
+
+
+@app.get("/api/jobs/{job_id}")
+async def api_get_job(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    return {
+        "job": job,
+        "events": job_events(job_id, limit=100),
+        "artifacts": job_artifacts(job_id),
+    }
+
+
+@app.get("/api/jobs/{job_id}/events")
+async def api_job_events(job_id: str, after_id: int = 0):
+    if not get_job(job_id):
+        raise HTTPException(status_code=404, detail="job not found")
+    return job_events(job_id, after_id=max(0, after_id), limit=200)
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def api_cancel_job(job_id: str):
+    if not get_job(job_id):
+        raise HTTPException(status_code=404, detail="job not found")
+    return {"ok": request_cancel(job_id)}
+
+
 @app.post("/api/chat")
 async def api_chat(data: ChatIn):
-    try:
-        result = await answer_detailed(data.message)
+    message = data.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+
+    # Fast conversational requests remain synchronous. Research/long work is
+    # persisted first and immediately acknowledged; the worker finishes it.
+    if not data.force_sync and should_enqueue(message):
+        job = create_job(message, metadata={"created_via": "chat"})
         return {
+            "accepted": True,
+            "async": True,
+            "job_id": job["id"],
+            "job_status": job["status"],
+            "response": "依頼を保存しました。調査・生成はバックグラウンドで続けます。画面を閉じてもJobは残ります。",
+            "recalled": [],
+        }
+
+    try:
+        result = await answer_detailed(message)
+        return {
+            "accepted": True,
+            "async": False,
             "response": result.response,
             "recalled": [
                 {"id": m["id"], "kind": m["kind"], "content": m["content"], "score": round(m["score"], 3)}
