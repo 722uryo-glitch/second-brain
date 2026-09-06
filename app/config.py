@@ -22,6 +22,12 @@ X_ENABLED = os.getenv("X_ENABLED", "true").lower() == "true"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "").strip()
 
+# Human-readable Obsidian knowledge layer. SQLite stays the source of truth.
+OBSIDIAN_ENABLED = os.getenv("OBSIDIAN_ENABLED", "true").lower() == "true"
+OBSIDIAN_VAULT_PATH = os.getenv("OBSIDIAN_VAULT_PATH", "obsidian_vault")
+OBSIDIAN_EXPORT_INTERVAL_MINUTES = int(os.getenv("OBSIDIAN_EXPORT_INTERVAL_MINUTES", "30"))
+OBSIDIAN_EXPORT_LIMIT = int(os.getenv("OBSIDIAN_EXPORT_LIMIT", "2000"))
+
 # Google News country/language editions. Failures are tolerated per-locale.
 GLOBAL_NEWS_LOCALES = [
     ("US","en-US","en"),("GB","en-GB","en"),("CA","en-CA","en"),("CA","fr-CA","fr"),
