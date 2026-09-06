@@ -12,23 +12,35 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
 EXTERNAL_COLLECTION_ENABLED = os.getenv("EXTERNAL_COLLECTION_ENABLED", "true").lower() == "true"
 EXTERNAL_COLLECTION_INTERVAL_MINUTES = int(os.getenv("EXTERNAL_COLLECTION_INTERVAL_MINUTES", "15"))
 EXTERNAL_ITEMS_PER_FEED = int(os.getenv("EXTERNAL_ITEMS_PER_FEED", "100"))
-EXTERNAL_CONCURRENCY = int(os.getenv("EXTERNAL_CONCURRENCY", "12"))
+EXTERNAL_CONCURRENCY = int(os.getenv("EXTERNAL_CONCURRENCY", "16"))
+DOCUMENT_FETCH_ENABLED = os.getenv("DOCUMENT_FETCH_ENABLED", "true").lower() == "true"
+DOCUMENT_FETCH_BATCH_SIZE = int(os.getenv("DOCUMENT_FETCH_BATCH_SIZE", "120"))
+DOCUMENT_FETCH_CONCURRENCY = int(os.getenv("DOCUMENT_FETCH_CONCURRENCY", "12"))
+
 FACTCHECK_ENABLED = os.getenv("FACTCHECK_ENABLED", "true").lower() == "true"
-FACTCHECK_INTERVAL_SECONDS = int(os.getenv("FACTCHECK_INTERVAL_SECONDS", "20"))
-FACTCHECK_BATCH_SIZE = int(os.getenv("FACTCHECK_BATCH_SIZE", "20"))
+FACTCHECK_INTERVAL_SECONDS = int(os.getenv("FACTCHECK_INTERVAL_SECONDS", "5"))
+FACTCHECK_BATCH_SIZE = int(os.getenv("FACTCHECK_BATCH_SIZE", "30"))
+FACTCHECK_MAX_BATCH_SIZE = int(os.getenv("FACTCHECK_MAX_BATCH_SIZE", "80"))
+
 GDELT_ENABLED = os.getenv("GDELT_ENABLED", "true").lower() == "true"
 GITHUB_ENABLED = os.getenv("GITHUB_ENABLED", "true").lower() == "true"
 X_ENABLED = os.getenv("X_ENABLED", "true").lower() == "true"
+BLUESKY_ENABLED = os.getenv("BLUESKY_ENABLED", "true").lower() == "true"
+REDDIT_ENABLED = os.getenv("REDDIT_ENABLED", "true").lower() == "true"
+MASTODON_ENABLED = os.getenv("MASTODON_ENABLED", "true").lower() == "true"
+
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "").strip()
 
-# Human-readable Obsidian knowledge layer. SQLite stays the source of truth.
+# Obsidian human-readable knowledge vault
 OBSIDIAN_ENABLED = os.getenv("OBSIDIAN_ENABLED", "true").lower() == "true"
 OBSIDIAN_VAULT_PATH = os.getenv("OBSIDIAN_VAULT_PATH", "obsidian_vault")
 OBSIDIAN_EXPORT_INTERVAL_MINUTES = int(os.getenv("OBSIDIAN_EXPORT_INTERVAL_MINUTES", "30"))
-OBSIDIAN_EXPORT_LIMIT = int(os.getenv("OBSIDIAN_EXPORT_LIMIT", "2000"))
+OBSIDIAN_MAX_CLAIMS = int(os.getenv("OBSIDIAN_MAX_CLAIMS", "300"))
+OBSIDIAN_MAX_EXTERNAL = int(os.getenv("OBSIDIAN_MAX_EXTERNAL", "500"))
+OBSIDIAN_MAX_MEMORIES = int(os.getenv("OBSIDIAN_MAX_MEMORIES", "200"))
 
-# Google News country/language editions. Failures are tolerated per-locale.
+# Google News country/language editions. Per-locale failures are tolerated.
 GLOBAL_NEWS_LOCALES = [
     ("US","en-US","en"),("GB","en-GB","en"),("CA","en-CA","en"),("CA","fr-CA","fr"),
     ("AU","en-AU","en"),("NZ","en-NZ","en"),("IE","en-IE","en"),("IN","en-IN","en"),
@@ -42,30 +54,55 @@ GLOBAL_NEWS_LOCALES = [
     ("BG","bg","bg"),("GR","el","el"),("UA","uk","uk"),("TR","tr","tr"),("IL","he","he"),
     ("AE","ar","ar"),("SA","ar","ar"),("EG","ar","ar"),("ZA","en-ZA","en"),("NG","en-NG","en"),
     ("KE","en-KE","en"),("BR","pt-BR","pt"),("MX","es-419","es"),("AR","es-419","es"),
-    ("CL","es-419","es"),("CO","es-419","es"),("PE","es-419","es"),
+    ("CL","es-419","es"),("CO","es-419","es"),("PE","es-419","es"),("RU","ru","ru"),
 ]
 
-# Broad GDELT query matrix. Each query can return up to 250 fresh articles.
 GDELT_QUERIES = [
     "politics OR election OR government", "economy OR inflation OR markets", "war OR conflict OR military",
     "technology OR software OR semiconductor", "artificial intelligence OR machine learning", "cybersecurity OR hack OR vulnerability",
     "science OR research OR discovery", "health OR disease OR medicine", "climate OR environment OR energy",
     "space OR satellite OR astronomy", "business OR startup OR company", "culture OR media OR entertainment",
+    "earthquake OR flood OR wildfire OR disaster", "law OR court OR regulation", "crypto OR blockchain OR bitcoin",
 ]
 
 GITHUB_EVENT_PAGES = int(os.getenv("GITHUB_EVENT_PAGES", "5"))
+GITHUB_SEARCH_QUERIES = [q.strip() for q in os.getenv(
+    "GITHUB_SEARCH_QUERIES",
+    "artificial intelligence,agent,llm,cybersecurity,open source,robotics,computer vision,developer tools"
+).split(",") if q.strip()]
+
 X_QUERIES = [q.strip() for q in os.getenv(
     "X_QUERIES",
     "AI,technology,cybersecurity,markets,politics,science,breaking news,war,climate,startup,open source"
 ).split(",") if q.strip()]
+
+SOCIAL_QUERIES = [q.strip() for q in os.getenv(
+    "SOCIAL_QUERIES",
+    "AI,technology,cybersecurity,science,markets,politics,war,climate,open source,startup"
+).split(",") if q.strip()]
+
+MASTODON_INSTANCES = [x.strip().rstrip("/") for x in os.getenv(
+    "MASTODON_INSTANCES",
+    "https://mastodon.social,https://fosstodon.org,https://mstdn.social"
+).split(",") if x.strip()]
+
+# Higher-credibility direct/primary feeds. Individual failures are tolerated.
+PRIMARY_SOURCE_FEEDS = [
+    ("NASA", "https://www.nasa.gov/rss/dyn/breaking_news.rss"),
+    ("CISA Advisories", "https://www.cisa.gov/cybersecurity-advisories/all.xml"),
+    ("US Federal Register", "https://www.federalregister.gov/documents/search.rss?conditions%5Border%5D=newest"),
+    ("European Commission Press", "https://ec.europa.eu/commission/presscorner/api/rss?language=en"),
+]
 
 DEFAULT_EXTERNAL_FEEDS = [
     ("BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml"),
     ("BBC Technology", "https://feeds.bbci.co.uk/news/technology/rss.xml"),
     ("arXiv AI", "https://export.arxiv.org/rss/cs.AI"),
     ("arXiv ML", "https://export.arxiv.org/rss/cs.LG"),
-    ("Hacker News", "https://hnrss.org/newest?points=50"),
+    ("arXiv Security", "https://export.arxiv.org/rss/cs.CR"),
+    ("Hacker News", "https://hnrss.org/newest?points=30"),
 ]
+
 _extra_feeds = os.getenv("SECOND_BRAIN_FEEDS", "").strip()
 EXTERNAL_FEEDS = list(DEFAULT_EXTERNAL_FEEDS)
 if _extra_feeds:
