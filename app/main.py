@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from .db import init_db, recent_memories, delete_memory, recent_external_items, recent_claims
 from .brain import answer, reflect
 from .memory import store_memory
-from .ollama_client import health
+from .ollama_client import health, router_status
 from .whisper_service import transcribe_bytes
 from .global_intelligence import (
     collect_global_information,
@@ -108,6 +108,7 @@ async def api_health():
             "version": "V1",
             "ollama": True,
             "models": [m.get("name") for m in tags.get("models", [])],
+            "ai_router": router_status(),
             "external_collection": EXTERNAL_COLLECTION_ENABLED,
             "external_collection_interval_minutes": EXTERNAL_COLLECTION_INTERVAL_MINUTES,
             "document_fetch": DOCUMENT_FETCH_ENABLED,
@@ -120,6 +121,11 @@ async def api_health():
         }
     except Exception as e:
         return {"ok": False, "ollama": False, "error": str(e)}
+
+
+@app.get("/api/ai-router/status")
+async def api_ai_router_status():
+    return router_status()
 
 
 @app.post("/api/chat")
