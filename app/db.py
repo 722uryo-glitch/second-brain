@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -248,7 +249,7 @@ def claim_evidence_sources(claim_id, limit=8):
         rows = conn.execute(
             """
             SELECT ce.stance,ce.credibility,ce.source_domain,ce.source_type,
-                   e.source,e.title,e.url,e.published_at,e.collected_at
+                   e.source,e.title,e.url,e.published_at,e.collected_at,e.metadata_json
             FROM claim_evidence ce
             JOIN external_items e ON e.id=ce.external_item_id
             WHERE ce.claim_id=?
@@ -294,31 +295,90 @@ def add_claim_evidence(claim_id, external_item_id, source_domain, source_type, s
             (claim_id, external_item_id, source_domain, source_type, stance, float(credibility), now),
         )
         conn.commit()
-        recompute_claim(claim_id)
+    recompute_claim(claim_id)
+
+
+def _normalize_title_lineage(title: str):
+    text = re.sub(r"\s+", " ", str(title or "").strip().lower())
+    # Search/RSS titles often append the publisher after a dash. Remove a short suffix.
+    parts = re.split(r"\s[-|–—]\s", text)
+    if len(parts) > 1 and len(parts[-1]) <= 45:
+        text = " ".join(parts[:-1])
+    text = re.sub(r"[^\w\u3040-\u30ff\u3400-\u9fff ]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()[:180]
+
+
+def _lineage_key(row):
+    try:
+        md = json.loads(row["metadata_json"] or "{}")
+    except Exception:
+        md = {}
+    for key in ("original_source", "wire_source", "canonical_source", "origin_domain"):
+        value = str(md.get(key) or "").strip().lower()
+        if value:
+            return f"origin:{value}"
+
+    source_type = str(row["source_type"] or "")
+    domain = str(row["source_domain"] or "").lower()
+    title_key = _normalize_title_lineage(row["title"])
+
+    # Primary documents are independently authoritative by origin domain/document.
+    if source_type == "primary":
+        return f"primary:{domain}:{title_key[:100]}"
+
+    # Identical/near-identical syndication titles across domains count once.
+    if title_key:
+        return f"story:{title_key}"
+    return f"domain:{domain or row['external_item_id']}"
 
 
 def recompute_claim(claim_id):
     with _lock, _connect() as conn:
-        rows = conn.execute("SELECT source_domain,stance,credibility FROM claim_evidence WHERE claim_id=?", (claim_id,)).fetchall()
+        rows = conn.execute(
+            """
+            SELECT ce.external_item_id,ce.source_domain,ce.source_type,ce.stance,ce.credibility,
+                   e.title,e.metadata_json
+            FROM claim_evidence ce
+            JOIN external_items e ON e.id=ce.external_item_id
+            WHERE ce.claim_id=?
+            """,
+            (claim_id,),
+        ).fetchall()
         if not rows:
             return
-        domains = {r["source_domain"] for r in rows if r["source_domain"]}
+
         supports = [r for r in rows if r["stance"] == "supports"]
         contradicts = [r for r in rows if r["stance"] == "contradicts"]
+        support_lineages = {_lineage_key(r) for r in supports}
+        contradiction_lineages = {_lineage_key(r) for r in contradicts}
+        support_domains = {r["source_domain"] for r in supports if r["source_domain"]}
+
         avg_cred = sum(float(r["credibility"]) for r in supports) / max(1, len(supports))
-        independent = len(domains)
-        if contradicts and supports:
+        independent = len(support_lineages)
+        contradiction_count = len(contradiction_lineages)
+
+        if supports and contradicts:
             status = "disputed"
-        elif independent >= 3 and avg_cred >= 0.6:
+        elif independent >= 3 and avg_cred >= 0.60:
             status = "corroborated"
-        elif independent >= 2:
+        elif independent >= 2 and avg_cred >= 0.45:
             status = "partially_corroborated"
         else:
             status = "unverified"
-        confidence = min(0.98, 0.18 * independent + 0.5 * avg_cred)
+
+        confidence = (
+            0.16 * independent
+            + 0.35 * avg_cred
+            + 0.05 * min(3, len(support_domains))
+            - 0.12 * contradiction_count
+        )
+        confidence = min(0.97, max(0.02, confidence))
         conn.execute(
             "UPDATE intelligence_claims SET status=?,confidence=?,evidence_count=?,independent_sources=?,contradictions=?,updated_at=? WHERE id=?",
-            (status, confidence, len(rows), independent, len(contradicts), datetime.now(timezone.utc).isoformat(), claim_id),
+            (
+                status, confidence, len(rows), independent, contradiction_count,
+                datetime.now(timezone.utc).isoformat(), claim_id,
+            ),
         )
         conn.commit()
 
@@ -336,11 +396,7 @@ def start_agent_run(user_request: str, goal: str = "", mode: str = "unknown", pl
             """INSERT INTO agent_runs(created_at,user_request,goal,mode,status,plan_json,metadata_json)
                VALUES(?,?,?,?,?,?,?)""",
             (
-                now,
-                user_request,
-                goal,
-                mode,
-                "running",
+                now, user_request, goal, mode, "running",
                 json.dumps(plan or {}, ensure_ascii=False),
                 json.dumps(metadata or {}, ensure_ascii=False),
             ),
