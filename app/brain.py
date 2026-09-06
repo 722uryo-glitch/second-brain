@@ -1,7 +1,16 @@
 import asyncio
+import json
+import re
+from datetime import datetime, timezone
+
 from .memory import recall, store_memory
 from .ollama_client import chat
-from .db import recent_memories
+from .db import (
+    recent_memories,
+    search_external_items,
+    search_claims,
+    claim_evidence_sources,
+)
 
 SYSTEM = """あなたはユーザー専用の『第2の脳』です。
 目的は、会話をその場限りで終わらせず、過去の記憶・現在の文脈・未完了事項を統合して支援することです。
@@ -25,6 +34,17 @@ SYSTEM = """あなたはユーザー専用の『第2の脳』です。
 - 返答は自然で簡潔にする。
 """
 
+_CURRENT_MARKERS = (
+    "現在", "今", "いま", "最新", "今日", "昨日", "今週", "情勢", "ニュース", "速報",
+    "どうなって", "どうなった", "最近", "現状", "リアルタイム", "latest", "current",
+    "today", "now", "news", "situation", "update",
+)
+_PUBLIC_TOPIC_MARKERS = (
+    "アメリカ", "米国", "iran", "イラン", "中国", "china", "ロシア", "russia", "ウクライナ",
+    "israel", "イスラエル", "gaza", "ガザ", "nato", "選挙", "政府", "戦争", "紛争", "市場",
+    "株", "ai", "openai", "google", "microsoft", "apple", "github", "cyber", "気候", "地震",
+)
+
 
 def _is_plain_greeting(text: str) -> bool:
     t = text.strip().lower().replace("！", "!").replace("？", "?")
@@ -35,21 +55,139 @@ def _is_plain_greeting(text: str) -> bool:
     return t in greetings
 
 
+def _is_current_public_question(text: str) -> bool:
+    t = text.lower()
+    has_current = any(x in t for x in _CURRENT_MARKERS)
+    has_public = any(x in t for x in _PUBLIC_TOPIC_MARKERS)
+    # "現在の○○情勢" and similar questions should always use the live knowledge store.
+    return has_current and (has_public or "情勢" in t or "ニュース" in t)
+
+
+def _extract_json_object(text: str):
+    try:
+        start, end = text.find("{"), text.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(text[start:end + 1])
+    except Exception:
+        pass
+    return {}
+
+
+async def _search_terms_for_question(user_text: str):
+    prompt = f"""Convert the user's current-affairs question into compact search terms for a multilingual news database.
+Return JSON only: {{"terms":[...]}}.
+Rules:
+- include important entity names in English and in the user's language when useful
+- include common aliases/acronyms (for example United States, US, U.S.)
+- do not answer the question
+- maximum 10 short terms
+Question: {user_text}
+"""
+    try:
+        raw = await chat([
+            {"role": "system", "content": "You generate database search keywords only."},
+            {"role": "user", "content": prompt},
+        ], temperature=0.0, num_predict=180, route="cloud")
+        obj = _extract_json_object(raw)
+        terms = [str(x).strip() for x in obj.get("terms", []) if str(x).strip()]
+        if terms:
+            return terms[:10]
+    except Exception as e:
+        print(f"[LIVE-RAG] keyword extraction failed: {e}")
+
+    # Safe fallback: extract meaningful chunks from the original query.
+    chunks = re.findall(r"[A-Za-z][A-Za-z0-9.\-]{1,30}|[一-龥ァ-ヶぁ-ん]{2,20}", user_text)
+    return chunks[:10]
+
+
+async def _public_intelligence_context(user_text: str):
+    terms = await _search_terms_for_question(user_text)
+    items = search_external_items(terms, limit=24)
+    claims = search_claims(terms, limit=12)
+
+    lines = [
+        f"CURRENT UTC TIME: {datetime.now(timezone.utc).isoformat()}",
+        f"SEARCH TERMS: {', '.join(terms)}",
+        "",
+        "RECENT COLLECTED SOURCES:",
+    ]
+    source_refs = []
+    for idx, item in enumerate(items, 1):
+        ref = f"S{idx}"
+        source_refs.append({
+            "ref": ref,
+            "title": item.get("title") or "",
+            "url": item.get("url") or "",
+            "source": item.get("source") or "",
+            "time": item.get("published_at") or item.get("collected_at") or "",
+        })
+        summary = (item.get("summary") or "").replace("\n", " ")[:500]
+        lines.append(
+            f"[{ref}] time={item.get('published_at') or item.get('collected_at') or ''} "
+            f"source={item.get('source') or ''} title={item.get('title') or ''} "
+            f"url={item.get('url') or ''} summary={summary}"
+        )
+
+    lines += ["", "FACT-CHECK CLAIMS:"]
+    for claim in claims:
+        lines.append(
+            f"- status={claim.get('status')} confidence={float(claim.get('confidence') or 0):.2f} "
+            f"independent_sources={claim.get('independent_sources')} contradictions={claim.get('contradictions')} "
+            f"claim={claim.get('claim_text')}"
+        )
+        for ev in claim_evidence_sources(claim.get("id"), limit=3):
+            lines.append(
+                f"  evidence: stance={ev.get('stance')} credibility={ev.get('credibility')} "
+                f"source={ev.get('source')} time={ev.get('published_at') or ev.get('collected_at')} url={ev.get('url')}"
+            )
+
+    return "\n".join(lines), source_refs
+
+
 async def _store_conversation_later(user_text: str, response: str):
-    """Persist conversation after the response is already ready for the user."""
     try:
         await store_memory("conversation", "user", user_text, 0.55)
-        # Assistant output is stored only as low-trust conversation history.
         await store_memory("conversation", "assistant", response, 0.20)
     except Exception as e:
         print(f"[MEMORY] background save failed: {e}")
 
 
 async def answer(user_text: str):
-    # Plain greetings should not trigger long-term memory retrieval. This avoids
-    # unrelated facts such as preferences leaking into ordinary small talk.
-    memories = [] if _is_plain_greeting(user_text) else await recall(user_text, top_k=6)
+    # Current public-affairs questions use the live collected intelligence store.
+    # Personal memories are intentionally NOT sent to the cloud in this path.
+    if _is_current_public_question(user_text):
+        context, refs = await _public_intelligence_context(user_text)
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are the current-affairs analysis module of a Second Brain. "
+                    "Use ONLY the supplied collected intelligence for claims about current events. "
+                    "Do not claim you lack real-time access: you have a local continuously collected intelligence store. "
+                    "If evidence is sparse or conflicting, say that explicitly. "
+                    "Prefer corroborated/primary evidence over social posts. "
+                    "Answer in the user's language. Cite source markers like [S1], [S2] inline. "
+                    "Do not invent events, dates, quotes, casualties, decisions, or diplomatic actions."
+                ),
+            },
+            {"role": "system", "content": context},
+            {"role": "user", "content": user_text},
+        ]
+        response = await chat(messages, temperature=0.15, num_predict=700, route="cloud")
+        if refs:
+            used = []
+            for ref in refs[:8]:
+                if f"[{ref['ref']}]" in response:
+                    used.append(ref)
+            if not used:
+                used = refs[:5]
+            response += "\n\n情報源:\n" + "\n".join(
+                f"[{r['ref']}] {r['source']} — {r['title']}\n{r['url']}" for r in used
+            )
+        asyncio.create_task(_store_conversation_later(user_text, response))
+        return response, []
 
+    memories = [] if _is_plain_greeting(user_text) else await recall(user_text, top_k=6)
     memory_text = "\n".join(
         f"- [{m['kind']}/{m['source']}] {m['content']}"
         for m in memories
