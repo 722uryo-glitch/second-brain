@@ -97,11 +97,22 @@ def init_jobs():
             CREATE INDEX IF NOT EXISTS idx_job_artifacts_job ON job_artifacts(job_id, id);
             """
         )
+        # This deployment intentionally runs one local worker process. A process
+        # restart invalidates every old worker id, so running jobs can be requeued
+        # immediately instead of waiting for their previous lease to expire.
         now = _now()
         conn.execute(
             """UPDATE jobs
-               SET status='queued', worker_id=NULL, lease_expires_at=NULL, current_step='recovered_after_restart', updated_at=?
-               WHERE status='running' AND (lease_expires_at IS NULL OR lease_expires_at < ?)""",
+               SET status='queued', worker_id=NULL, lease_expires_at=NULL,
+                   current_step='recovered_after_restart', updated_at=?
+               WHERE status='running' AND cancel_requested=0""",
+            (now,),
+        )
+        conn.execute(
+            """UPDATE jobs
+               SET status='cancelled', finished_at=?, updated_at=?, current_step='cancelled',
+                   worker_id=NULL, lease_expires_at=NULL
+               WHERE status IN ('queued','running') AND cancel_requested=1""",
             (now, now),
         )
         conn.commit()
@@ -188,15 +199,29 @@ def artifacts(job_id: str):
 
 
 def request_cancel(job_id: str):
+    now = _now()
+    event_type = None
     with _lock, _connect() as conn:
-        cur = conn.execute(
-            "UPDATE jobs SET cancel_requested=1,updated_at=? WHERE id=? AND status IN ('queued','running')",
-            (_now(), job_id),
-        )
+        row = conn.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if not row or row["status"] not in {"queued", "running"}:
+            return False
+        if row["status"] == "queued":
+            conn.execute(
+                """UPDATE jobs SET cancel_requested=1,status='cancelled',finished_at=?,updated_at=?,current_step='cancelled'
+                   WHERE id=?""",
+                (now, now, job_id),
+            )
+            event_type = "cancelled"
+        else:
+            conn.execute("UPDATE jobs SET cancel_requested=1,updated_at=? WHERE id=?", (now, job_id))
+            event_type = "cancel_requested"
         conn.commit()
-    if cur.rowcount:
-        add_event(job_id, "cancel_requested", "取消要求を受け付けました。")
-    return bool(cur.rowcount)
+    add_event(
+        job_id,
+        event_type,
+        "Jobを取り消しました。" if event_type == "cancelled" else "取消要求を受け付けました。現在の子処理にも伝播します。",
+    )
+    return True
 
 
 def _claim_job(worker_id: str):
@@ -205,7 +230,7 @@ def _claim_job(worker_id: str):
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
             """UPDATE jobs SET status='queued',worker_id=NULL,lease_expires_at=NULL,current_step='recovered_after_lease_expiry',updated_at=?
-               WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at < ?""",
+               WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at < ? AND cancel_requested=0""",
             (now, now),
         )
         row = conn.execute(
