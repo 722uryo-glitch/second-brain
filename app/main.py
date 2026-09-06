@@ -26,6 +26,8 @@ from .config import (
     DMN_INTERVAL_MINUTES,
     EXTERNAL_COLLECTION_ENABLED,
     EXTERNAL_COLLECTION_INTERVAL_MINUTES,
+    DOCUMENT_FETCH_ENABLED,
+    DOCUMENT_FETCH_INTERVAL_SECONDS,
     FACTCHECK_ENABLED,
     FACTCHECK_INTERVAL_SECONDS,
     OBSIDIAN_ENABLED,
@@ -42,6 +44,21 @@ async def dmn_loop():
             print(f"[DMN] reflection failed: {e}")
 
 
+async def document_fetch_loop():
+    """Continuously drain full-text fetch work instead of only fetching once per collection run."""
+    while True:
+        try:
+            result = await fetch_document_bodies()
+            if result.get("attempted"):
+                print(
+                    f"[DOCUMENTS] attempted={result.get('attempted', 0)} "
+                    f"ok={result.get('ok', 0)} failed={result.get('failed', 0)}"
+                )
+        except Exception as e:
+            print(f"[DOCUMENTS] fetch failed: {e}")
+        await asyncio.sleep(max(2, DOCUMENT_FETCH_INTERVAL_SECONDS))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -51,6 +68,8 @@ async def lifespan(app: FastAPI):
         tasks.append(asyncio.create_task(dmn_loop()))
     if EXTERNAL_COLLECTION_ENABLED:
         tasks.append(asyncio.create_task(global_collection_loop(EXTERNAL_COLLECTION_INTERVAL_MINUTES)))
+    if DOCUMENT_FETCH_ENABLED:
+        tasks.append(asyncio.create_task(document_fetch_loop()))
     if FACTCHECK_ENABLED:
         tasks.append(asyncio.create_task(factcheck_loop(FACTCHECK_INTERVAL_SECONDS)))
     if OBSIDIAN_ENABLED:
@@ -91,6 +110,8 @@ async def api_health():
             "models": [m.get("name") for m in tags.get("models", [])],
             "external_collection": EXTERNAL_COLLECTION_ENABLED,
             "external_collection_interval_minutes": EXTERNAL_COLLECTION_INTERVAL_MINUTES,
+            "document_fetch": DOCUMENT_FETCH_ENABLED,
+            "document_fetch_interval_seconds": DOCUMENT_FETCH_INTERVAL_SECONDS,
             "factcheck": FACTCHECK_ENABLED,
             "factcheck_interval_seconds": FACTCHECK_INTERVAL_SECONDS,
             "obsidian": OBSIDIAN_ENABLED,
