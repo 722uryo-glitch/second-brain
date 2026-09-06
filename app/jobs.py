@@ -3,7 +3,6 @@ import json
 import os
 import sqlite3
 import threading
-import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,6 +10,7 @@ from pathlib import Path
 from .config import DB_PATH
 from .executive import run as executive_run
 from .orchestrator import is_research_task, is_current_task
+from .progress import set_reporter, reset_reporter
 
 _lock = threading.RLock()
 
@@ -97,7 +97,6 @@ def init_jobs():
             CREATE INDEX IF NOT EXISTS idx_job_artifacts_job ON job_artifacts(job_id, id);
             """
         )
-        # A process may have died while owning a job. Requeue expired/stale work.
         now = _now()
         conn.execute(
             """UPDATE jobs
@@ -204,7 +203,6 @@ def _claim_job(worker_id: str):
     now = _now()
     with _lock, _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        # Recover abandoned leases before selecting new work.
         conn.execute(
             """UPDATE jobs SET status='queued',worker_id=NULL,lease_expires_at=NULL,current_step='recovered_after_lease_expiry',updated_at=?
                WHERE status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at < ?""",
@@ -227,11 +225,12 @@ def _claim_job(worker_id: str):
 
 
 def _heartbeat(job_id: str, worker_id: str, step=None):
+    now = _now()
     with _lock, _connect() as conn:
         conn.execute(
             """UPDATE jobs SET heartbeat_at=?,updated_at=?,lease_expires_at=?,current_step=COALESCE(?,current_step)
                WHERE id=? AND worker_id=? AND status='running'""",
-            (_now(), _now(), _future(JOB_LEASE_SECONDS), step, job_id, worker_id),
+            (now, now, _future(JOB_LEASE_SECONDS), step, job_id, worker_id),
         )
         conn.commit()
 
@@ -262,31 +261,55 @@ async def _heartbeat_loop(job_id: str, worker_id: str):
 
 async def _execute(job: dict, worker_id: str):
     job_id = job["id"]
-    if get_job(job_id).get("cancel_requested"):
+    current = get_job(job_id)
+    if current and current.get("cancel_requested"):
         _finish(job_id, worker_id, "cancelled", error="cancelled before start")
         return
+
+    def reporter(step, message, data):
+        _heartbeat(job_id, worker_id, step)
+        add_event(job_id, "progress", message or step, {"step": step, **(data or {})})
 
     _heartbeat(job_id, worker_id, "executive")
     add_event(job_id, "progress", "目的整理・記憶検索・必要情報の調査を開始しました。", {"step": "executive"})
     hb = asyncio.create_task(_heartbeat_loop(job_id, worker_id))
+    token = set_reporter(reporter)
+    task = asyncio.create_task(executive_run(job["request"]))
+    deadline = asyncio.get_running_loop().time() + max(30, int(job.get("max_runtime_seconds") or JOB_MAX_RUNTIME_SECONDS))
     try:
-        timeout = max(30, int(job.get("max_runtime_seconds") or JOB_MAX_RUNTIME_SECONDS))
-        result = await asyncio.wait_for(executive_run(job["request"]), timeout=timeout)
+        while not task.done():
+            current = get_job(job_id)
+            if current and current.get("cancel_requested"):
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                _finish(job_id, worker_id, "cancelled", error="cancel requested")
+                return
+            if asyncio.get_running_loop().time() >= deadline:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                _finish(job_id, worker_id, "partial", error="job runtime budget exhausted")
+                return
+            await asyncio.sleep(0.8)
+
+        result = task.result()
         current = get_job(job_id)
         if current and current.get("cancel_requested"):
             _finish(job_id, worker_id, "cancelled", error="cancel requested")
             return
-        if result.mode == "timeout":
-            _finish(job_id, worker_id, "partial", result_text=result.response, error="executive timeout", agent_run_id=result.run_id)
-        else:
-            _finish(job_id, worker_id, "succeeded", result_text=result.response, agent_run_id=result.run_id)
-    except asyncio.TimeoutError:
-        _finish(job_id, worker_id, "partial", error="job runtime budget exhausted")
+        _finish(job_id, worker_id, "succeeded", result_text=result.response, agent_run_id=result.run_id)
     except asyncio.CancelledError:
+        task.cancel()
         raise
     except Exception as e:
         _finish(job_id, worker_id, "failed", error=str(e))
     finally:
+        reset_reporter(token)
         hb.cancel()
 
 
