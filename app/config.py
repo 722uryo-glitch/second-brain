@@ -8,7 +8,6 @@ DMN_INTERVAL_MINUTES = int(os.getenv("DMN_INTERVAL_MINUTES", "30"))
 DMN_ENABLED = os.getenv("DMN_ENABLED", "true").lower() == "true"
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "small")
 
-# V1 global intelligence collector
 EXTERNAL_COLLECTION_ENABLED = os.getenv("EXTERNAL_COLLECTION_ENABLED", "true").lower() == "true"
 EXTERNAL_COLLECTION_INTERVAL_MINUTES = int(os.getenv("EXTERNAL_COLLECTION_INTERVAL_MINUTES", "15"))
 EXTERNAL_ITEMS_PER_FEED = int(os.getenv("EXTERNAL_ITEMS_PER_FEED", "100"))
@@ -32,15 +31,15 @@ MASTODON_ENABLED = os.getenv("MASTODON_ENABLED", "true").lower() == "true"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "").strip()
 
-# Obsidian human-readable knowledge vault
 OBSIDIAN_ENABLED = os.getenv("OBSIDIAN_ENABLED", "true").lower() == "true"
 OBSIDIAN_VAULT_PATH = os.getenv("OBSIDIAN_VAULT_PATH", "obsidian_vault")
 OBSIDIAN_EXPORT_INTERVAL_MINUTES = int(os.getenv("OBSIDIAN_EXPORT_INTERVAL_MINUTES", "30"))
 OBSIDIAN_MAX_CLAIMS = int(os.getenv("OBSIDIAN_MAX_CLAIMS", "300"))
 OBSIDIAN_MAX_EXTERNAL = int(os.getenv("OBSIDIAN_MAX_EXTERNAL", "500"))
 OBSIDIAN_MAX_MEMORIES = int(os.getenv("OBSIDIAN_MAX_MEMORIES", "200"))
+# Backward-compatible value used by the current exporter.
+OBSIDIAN_EXPORT_LIMIT = int(os.getenv("OBSIDIAN_EXPORT_LIMIT", str(max(OBSIDIAN_MAX_CLAIMS, OBSIDIAN_MAX_EXTERNAL, OBSIDIAN_MAX_MEMORIES))))
 
-# Google News country/language editions. Per-locale failures are tolerated.
 GLOBAL_NEWS_LOCALES = [
     ("US","en-US","en"),("GB","en-GB","en"),("CA","en-CA","en"),("CA","fr-CA","fr"),
     ("AU","en-AU","en"),("NZ","en-NZ","en"),("IE","en-IE","en"),("IN","en-IN","en"),
@@ -86,7 +85,6 @@ MASTODON_INSTANCES = [x.strip().rstrip("/") for x in os.getenv(
     "https://mastodon.social,https://fosstodon.org,https://mstdn.social"
 ).split(",") if x.strip()]
 
-# Higher-credibility direct/primary feeds. Individual failures are tolerated.
 PRIMARY_SOURCE_FEEDS = [
     ("NASA", "https://www.nasa.gov/rss/dyn/breaking_news.rss"),
     ("CISA Advisories", "https://www.cisa.gov/cybersecurity-advisories/all.xml"),
