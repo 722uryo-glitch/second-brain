@@ -4,3 +4,4 @@ httpx==0.28.1
 python-multipart==0.0.20
 openai-whisper==20250625
 numpy==2.2.6
+trafilatura==2.2.0
