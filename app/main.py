@@ -18,6 +18,7 @@ from .global_intelligence import (
     factcheck_loop,
     intelligence_status,
 )
+from .obsidian_export import export_to_obsidian, obsidian_export_loop
 from .config import (
     DMN_ENABLED,
     DMN_INTERVAL_MINUTES,
@@ -25,6 +26,8 @@ from .config import (
     EXTERNAL_COLLECTION_INTERVAL_MINUTES,
     FACTCHECK_ENABLED,
     FACTCHECK_INTERVAL_SECONDS,
+    OBSIDIAN_ENABLED,
+    OBSIDIAN_EXPORT_INTERVAL_MINUTES,
 )
 
 
@@ -47,6 +50,8 @@ async def lifespan(app: FastAPI):
         tasks.append(asyncio.create_task(global_collection_loop(EXTERNAL_COLLECTION_INTERVAL_MINUTES)))
     if FACTCHECK_ENABLED:
         tasks.append(asyncio.create_task(factcheck_loop(FACTCHECK_INTERVAL_SECONDS)))
+    if OBSIDIAN_ENABLED:
+        tasks.append(asyncio.create_task(obsidian_export_loop(OBSIDIAN_EXPORT_INTERVAL_MINUTES)))
     yield
     for task in tasks:
         task.cancel()
@@ -84,6 +89,8 @@ async def api_health():
             "external_collection_interval_minutes": EXTERNAL_COLLECTION_INTERVAL_MINUTES,
             "factcheck": FACTCHECK_ENABLED,
             "factcheck_interval_seconds": FACTCHECK_INTERVAL_SECONDS,
+            "obsidian": OBSIDIAN_ENABLED,
+            "obsidian_export_interval_minutes": OBSIDIAN_EXPORT_INTERVAL_MINUTES,
             "intelligence": intelligence_status(),
         }
     except Exception as e:
@@ -135,6 +142,14 @@ async def api_collect():
 @app.post("/api/factcheck")
 async def api_factcheck(limit: int = 20):
     return await factcheck_batch(min(max(limit, 1), 100))
+
+
+@app.post("/api/obsidian/export")
+async def api_obsidian_export():
+    try:
+        return await asyncio.to_thread(export_to_obsidian)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/external/latest")
