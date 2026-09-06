@@ -2,7 +2,7 @@ import hashlib
 import json
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from .config import DB_PATH
@@ -76,6 +76,12 @@ def init_v1_storage():
                 ON verification_audit(claim_id, created_at DESC);
             """
         )
+        # Backward-compatible migration for existing local databases.
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(external_documents)").fetchall()}
+        if "attempts" not in columns:
+            conn.execute("ALTER TABLE external_documents ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+        if "next_retry_at" not in columns:
+            conn.execute("ALTER TABLE external_documents ADD COLUMN next_retry_at TEXT")
         conn.commit()
 
 
@@ -121,46 +127,82 @@ def finish_collection_run(run_id, fetched, new_items, errors, skipped, details):
 
 
 def pending_document_items(limit=100):
+    init_v1_storage()
+    now = _now()
     with _lock, _connect() as conn:
         rows = conn.execute(
             """
             SELECT e.* FROM external_items e
             LEFT JOIN external_documents d ON d.external_item_id=e.id
             WHERE d.external_item_id IS NULL
-            ORDER BY e.id DESC LIMIT ?
+               OR (
+                    d.fetch_status='error'
+                    AND COALESCE(d.attempts,0) < 4
+                    AND (d.next_retry_at IS NULL OR d.next_retry_at <= ?)
+               )
+            ORDER BY CASE WHEN d.external_item_id IS NULL THEN 0 ELSE 1 END, e.id DESC
+            LIMIT ?
             """,
-            (int(limit),),
+            (now, int(limit)),
         ).fetchall()
     return [dict(r) for r in rows]
 
 
 def save_document(external_item_id, final_url, body_text, status="ok", http_status=None, error=None):
+    init_v1_storage()
     body_text = (body_text or "").strip()
     digest = hashlib.sha256(body_text.encode("utf-8", errors="ignore")).hexdigest() if body_text else None
     with _lock, _connect() as conn:
+        existing = conn.execute(
+            "SELECT attempts FROM external_documents WHERE external_item_id=?", (int(external_item_id),)
+        ).fetchone()
+        attempts = (int(existing["attempts"]) if existing else 0) + 1
+        next_retry_at = None
+        if status == "error" and attempts < 4:
+            delay_seconds = min(3600, 60 * (2 ** max(0, attempts - 1)))
+            next_retry_at = (datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)).isoformat()
         conn.execute(
             """
-            INSERT INTO external_documents(external_item_id,fetched_at,final_url,content_hash,body_text,fetch_status,http_status,error)
-            VALUES(?,?,?,?,?,?,?,?)
+            INSERT INTO external_documents(
+                external_item_id,fetched_at,final_url,content_hash,body_text,fetch_status,http_status,error,attempts,next_retry_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(external_item_id) DO UPDATE SET
-                fetched_at=excluded.fetched_at,final_url=excluded.final_url,content_hash=excluded.content_hash,
-                body_text=excluded.body_text,fetch_status=excluded.fetch_status,http_status=excluded.http_status,error=excluded.error
+                fetched_at=excluded.fetched_at,
+                final_url=excluded.final_url,
+                content_hash=excluded.content_hash,
+                body_text=excluded.body_text,
+                fetch_status=excluded.fetch_status,
+                http_status=excluded.http_status,
+                error=excluded.error,
+                attempts=excluded.attempts,
+                next_retry_at=excluded.next_retry_at
             """,
-            (int(external_item_id), _now(), final_url, digest, body_text[:50000], status, http_status, error),
+            (
+                int(external_item_id), _now(), final_url, digest, body_text[:50000], status,
+                http_status, error, attempts, next_retry_at,
+            ),
         )
         conn.commit()
 
 
 def document_for_item(external_item_id):
+    init_v1_storage()
     with _lock, _connect() as conn:
         row = conn.execute("SELECT * FROM external_documents WHERE external_item_id=?", (int(external_item_id),)).fetchone()
     return dict(row) if row else None
 
 
 def queue_metrics():
+    init_v1_storage()
+    now = _now()
     with _lock, _connect() as conn:
         ext = conn.execute("SELECT COUNT(*) c FROM external_items").fetchone()["c"]
         docs = conn.execute("SELECT COUNT(*) c FROM external_documents WHERE fetch_status='ok'").fetchone()["c"]
+        doc_errors = conn.execute("SELECT COUNT(*) c FROM external_documents WHERE fetch_status='error'").fetchone()["c"]
+        retryable = conn.execute(
+            """SELECT COUNT(*) c FROM external_documents
+               WHERE fetch_status='error' AND attempts<4 AND (next_retry_at IS NULL OR next_retry_at<=?)""", (now,)
+        ).fetchone()["c"]
         claims = conn.execute("SELECT COUNT(*) c FROM intelligence_claims").fetchone()["c"]
         evidence = conn.execute("SELECT COUNT(*) c FROM claim_evidence").fetchone()["c"]
         unprocessed = conn.execute(
@@ -171,6 +213,8 @@ def queue_metrics():
     return {
         "external_items": int(ext),
         "documents": int(docs),
+        "document_errors": int(doc_errors),
+        "document_retries_ready": int(retryable),
         "claims": int(claims),
         "evidence": int(evidence),
         "factcheck_backlog": int(unprocessed),
