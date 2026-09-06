@@ -4,28 +4,37 @@ from datetime import datetime, timezone
 
 from .memory import recall, store_memory
 from .ollama_client import chat
-from .db import recent_memories, search_external_items, search_claims, claim_evidence_sources
+from .db import (
+    recent_memories,
+    recent_conversation,
+    search_external_items,
+    search_claims,
+    claim_evidence_sources,
+)
 
 SYSTEM = """あなたはユーザー専用の『第2の脳』です。
-目的は、会話をその場限りで終わらせず、過去の記憶・現在の文脈・未完了事項を統合して支援することです。
+目的は、過去の文脈・現在の依頼・必要な知識を統合して、実際に役立つ答えと成果物を返すことです。
+
+行動原則:
+- ユーザーが『任せる』『なんでもいい』『調べてやって』と言ったら、合理的な仮定を置いて自分で進める。不要な確認質問をしない。
+- 前の発言で既に分かっていることを、もう一度質問しない。
+- 質問に答えるだけでなく、依頼なら実行可能な形まで具体化する。
+- 迷った場合は最も妥当な選択肢を選び、その選択を短く明示して進める。
+- ありきたりな一般論だけで終わらせない。
+- 返答は自然で、必要十分な具体性を持たせる。
 
 記憶の信頼順位:
-1. manual で保存された記憶
+1. manual
 2. user 由来の preference / user_fact / decision / task
 3. user の conversation / whisper transcript
 4. reflection / dmn
 5. assistant の過去発言
 
-原則:
-- 記憶は、現在の発言に直接関係するときだけ使う。
-- 関係のない記憶を、会話に無理やり差し込まない。
-- あいさつや雑談には、関連する記憶がなければ普通に返す。
-- manual または user 由来の明示的な記憶は、関連している場合に最優先で扱う。
-- assistant の過去発言は事実ではなく、過去の生成結果にすぎない。
-- assistant の過去発言と user/manual の記憶が矛盾する場合、user/manual を優先する。
+記憶の原則:
+- 関係する記憶だけ使う。
+- assistant の過去発言は事実として扱わない。
+- user/manual と assistant が矛盾する場合は user/manual を優先する。
 - 記憶にないことを『覚えている』とは言わない。
-- 明示的な好み・事実・決定事項については勝手に別の答えを推測しない。
-- 返答は自然で簡潔にする。
 """
 
 _CURRENT_MARKERS = (
@@ -38,7 +47,10 @@ _PUBLIC_TOPIC_MARKERS = (
     "israel", "イスラエル", "gaza", "ガザ", "nato", "選挙", "政府", "戦争", "紛争", "市場",
     "株", "ai", "openai", "google", "microsoft", "apple", "github", "cyber", "気候", "地震",
 )
-
+_PERSONAL_MARKERS = (
+    "私の", "僕の", "俺の", "自分の", "覚えて", "前に話", "前回", "好み", "予定", "タスク",
+    "住所", "電話", "メール", "家族", "友達", "学校", "職場", "仕事の", "名前", "誕生日",
+)
 _ALIASES = {
     "アメリカ": ["アメリカ", "米国", "United States", "US"],
     "米国": ["米国", "アメリカ", "United States", "US"],
@@ -74,34 +86,28 @@ def _is_current_public_question(text: str) -> bool:
     return has_current and (has_public or "情勢" in t or "ニュース" in t)
 
 
+def _looks_personal(text: str) -> bool:
+    t = text.lower()
+    return any(x.lower() in t for x in _PERSONAL_MARKERS)
+
+
 def _fast_search_terms(user_text: str):
-    """Build search terms locally. This intentionally avoids an extra LLM call."""
     t = user_text.lower()
     terms = []
-
     for needle, aliases in _ALIASES.items():
         if needle.lower() in t:
             terms.extend(aliases)
-
-    # English words/acronyms are already useful DB search keys.
     terms.extend(re.findall(r"[A-Za-z][A-Za-z0-9.\-]{1,30}", user_text))
-
-    # Japanese katakana compounds often contain adjacent entity names
-    # (e.g. アメリカイラン). Add 3-6 char windows so both entities can match.
     for seq in re.findall(r"[ァ-ヶー]{4,20}", user_text):
         for size in (6, 5, 4, 3):
             if len(seq) >= size:
                 for i in range(0, len(seq) - size + 1):
                     terms.append(seq[i:i + size])
-
-    # Useful kanji chunks after removing conversational boilerplate.
     cleaned = user_text
     for stop in ("について教えて", "について", "教えて", "現在", "最新", "今日", "情勢", "ニュース", "現状"):
         cleaned = cleaned.replace(stop, " ")
     terms.extend(re.findall(r"[一-龥]{2,8}", cleaned))
-
-    out = []
-    seen = set()
+    out, seen = [], set()
     for term in terms:
         term = term.strip()
         key = term.lower()
@@ -114,14 +120,21 @@ def _fast_search_terms(user_text: str):
     return out or [user_text[:40]]
 
 
+def _short_history(limit=8):
+    rows = recent_conversation(limit)
+    messages = []
+    for row in rows:
+        role = "user" if row.get("source") == "user" else "assistant"
+        content = str(row.get("content") or "").strip()
+        if content:
+            messages.append({"role": role, "content": content[:1800]})
+    return messages
+
+
 async def _public_intelligence_context(user_text: str):
     terms = _fast_search_terms(user_text)
-
-    # SQLite searches are fast; keep the prompt compact because prompt size is
-    # a major latency source for free cloud models.
     items = search_external_items(terms, limit=12)
     claims = search_claims(terms, limit=5)
-
     lines = [
         f"CURRENT UTC TIME: {datetime.now(timezone.utc).isoformat()}",
         f"SEARCH TERMS: {', '.join(terms)}",
@@ -142,7 +155,6 @@ async def _public_intelligence_context(user_text: str):
             f"[{ref}] {item.get('published_at') or item.get('collected_at') or ''} | "
             f"{item.get('source') or ''} | {item.get('title') or ''} | {summary} | {item.get('url') or ''}"
         )
-
     if claims:
         lines.append("FACT-CHECK CLAIMS:")
     for claim in claims:
@@ -156,7 +168,6 @@ async def _public_intelligence_context(user_text: str):
                 f"  evidence {ev.get('stance')} cred={ev.get('credibility')} | "
                 f"{ev.get('source')} | {ev.get('url')}"
             )
-
     return "\n".join(lines), source_refs
 
 
@@ -169,6 +180,7 @@ async def _store_conversation_later(user_text: str, response: str):
 
 
 async def answer(user_text: str):
+    # 1) Current public affairs: local RAG + cloud synthesis.
     if _is_current_public_question(user_text):
         context, refs = await _public_intelligence_context(user_text)
         messages = [
@@ -176,35 +188,54 @@ async def answer(user_text: str):
                 "role": "system",
                 "content": (
                     "You are the current-affairs analysis module of a Second Brain. "
-                    "Use only the supplied collected intelligence for current-event claims. "
+                    "Use only supplied collected intelligence for current-event claims. "
                     "If evidence is sparse or conflicting, say so. Prefer primary/corroborated evidence. "
-                    "Answer in the user's language, concise but useful. Cite [S1], [S2] inline. "
-                    "Do not invent facts."
+                    "Answer in the user's language. Cite [S1], [S2] inline. Do not invent facts."
                 ),
             },
             {"role": "system", "content": context},
             {"role": "user", "content": user_text},
         ]
-        # Use the fast cloud lane. The evidence was already collected locally,
-        # so search/thinking models only add latency here.
         response = await chat(messages, temperature=0.1, num_predict=420, route="fast_cloud")
         if refs:
-            used = [r for r in refs[:6] if f"[{r['ref']}]" in response]
-            if not used:
-                used = refs[:4]
+            used = [r for r in refs[:6] if f"[{r['ref']}]" in response] or refs[:4]
             response += "\n\n情報源:\n" + "\n".join(
                 f"[{r['ref']}] {r['source']} — {r['title']}\n{r['url']}" for r in used
             )
         asyncio.create_task(_store_conversation_later(user_text, response))
         return response, []
 
+    # 2) Generic work/questions: use the stronger cloud model with recent dialogue.
+    #    No long-term personal memory is sent in this lane.
+    if not _looks_personal(user_text):
+        history = _short_history(8)
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are the main reasoning/working module of a user's Second Brain. "
+                    "Continue the conversation naturally using the recent dialogue. "
+                    "Do not repeat questions already answered. "
+                    "When the user delegates choices or says 'anything is fine', choose a sensible option and proceed. "
+                    "Prefer concrete execution over generic advice or unnecessary clarification. "
+                    "Answer in the user's language."
+                ),
+            },
+            *history,
+            {"role": "user", "content": user_text},
+        ]
+        response = await chat(messages, temperature=0.25, num_predict=520, route="fast_cloud")
+        asyncio.create_task(_store_conversation_later(user_text, response))
+        return response, []
+
+    # 3) Personal-memory lane: keep it local and use semantic long-term memory.
     memories = [] if _is_plain_greeting(user_text) else await recall(user_text, top_k=6)
     memory_text = "\n".join(
         f"- [{m['kind']}/{m['source']}] {m['content']}" for m in memories
     ) or "（関連記憶なし）"
-
     messages = [
         {"role": "system", "content": SYSTEM},
+        *_short_history(8),
         {
             "role": "system",
             "content": (
@@ -214,7 +245,7 @@ async def answer(user_text: str):
         },
         {"role": "user", "content": user_text},
     ]
-    response = await chat(messages, num_predict=280)
+    response = await chat(messages, num_predict=360, route="local")
     asyncio.create_task(_store_conversation_later(user_text, response))
     return response, memories
 
@@ -223,7 +254,6 @@ async def reflect():
     recent = list(reversed(recent_memories(25)))
     if not recent:
         return "記憶がまだないため、内省をスキップしました。"
-
     feed = "\n".join(f"[{m['kind']}/{m['source']}] {m['content']}" for m in recent)
     prompt = f"""最近の記憶を読み、内部用の短い内省を1つ作ってください。
 manual / user の記憶を優先し、assistant の過去発言を事実扱いしないでください。
@@ -236,8 +266,7 @@ manual / user の記憶を優先し、assistant の過去発言を事実扱い�
     result = await chat([
         {"role": "system", "content": "あなたは第2の脳の内省モジュールです。"},
         {"role": "user", "content": prompt},
-    ], temperature=0.3, num_predict=160)
-
+    ], temperature=0.3, num_predict=160, route="local")
     if result.strip() != "NO_REFLECTION":
         await store_memory("reflection", "dmn", result.strip(), 0.60)
     return result.strip()
