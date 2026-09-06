@@ -1,0 +1,20 @@
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: "Second Brain Search"
+
+search:
+  safe_search: 1
+  autocomplete: ""
+  formats:
+    - html
+    - json
+
+server:
+  secret_key: "second-brain-local-only-change-me"
+  limiter: false
+  image_proxy: false
+
+# This service is bound to 127.0.0.1 by docker-compose.searxng.yml and is intended
+# only as a private local metasearch backend for the Second Brain.
