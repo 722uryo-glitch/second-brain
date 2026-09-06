@@ -17,7 +17,9 @@ from .global_intelligence import (
     factcheck_batch,
     factcheck_loop,
     intelligence_status,
+    fetch_document_bodies,
 )
+from .v1_storage import init_v1_storage, source_health, queue_metrics
 from .obsidian_export import export_to_obsidian, obsidian_export_loop
 from .config import (
     DMN_ENABLED,
@@ -43,6 +45,7 @@ async def dmn_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    init_v1_storage()
     tasks = []
     if DMN_ENABLED:
         tasks.append(asyncio.create_task(dmn_loop()))
@@ -83,6 +86,7 @@ async def api_health():
         tags = await health()
         return {
             "ok": True,
+            "version": "V1",
             "ollama": True,
             "models": [m.get("name") for m in tags.get("models", [])],
             "external_collection": EXTERNAL_COLLECTION_ENABLED,
@@ -139,9 +143,14 @@ async def api_collect():
     return await collect_global_information()
 
 
+@app.post("/api/documents/fetch")
+async def api_documents_fetch(limit: int = 120):
+    return await fetch_document_bodies(limit=min(max(limit, 1), 1000))
+
+
 @app.post("/api/factcheck")
-async def api_factcheck(limit: int = 20):
-    return await factcheck_batch(min(max(limit, 1), 100))
+async def api_factcheck(limit: int = 30):
+    return await factcheck_batch(min(max(limit, 1), 80))
 
 
 @app.post("/api/obsidian/export")
@@ -165,6 +174,16 @@ async def api_claims_latest(limit: int = 100):
 @app.get("/api/intelligence/status")
 async def api_intelligence_status():
     return intelligence_status()
+
+
+@app.get("/api/intelligence/queues")
+async def api_intelligence_queues():
+    return queue_metrics()
+
+
+@app.get("/api/intelligence/sources")
+async def api_intelligence_sources(limit: int = 200):
+    return source_health(min(max(limit, 1), 1000))
 
 
 @app.post("/api/transcribe")
