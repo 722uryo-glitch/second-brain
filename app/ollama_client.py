@@ -45,6 +45,19 @@ def _looks_like_public_intelligence(messages) -> bool:
     return any(marker in text for marker in markers)
 
 
+def _fast_model_order(models):
+    """Prefer non-thinking flash models for latency-sensitive chat."""
+    def score(name: str):
+        n = name.lower()
+        penalty = 0
+        if "think" in n or "reason" in n or "search" in n:
+            penalty += 10
+        if "flash" in n:
+            penalty -= 2
+        return penalty
+    return sorted(list(models), key=score)
+
+
 async def health():
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(_url("/api/tags"))
@@ -74,7 +87,7 @@ async def _ollama_chat(messages, model=None, temperature=0.4, num_predict=384):
         return data["message"]["content"]
 
 
-async def _uno_chat(messages, models, temperature=0.4, num_predict=384):
+async def _uno_chat(messages, models, temperature=0.4, num_predict=384, fast=False):
     if not UNOROUTER_API_KEY:
         raise RuntimeError("UNOROUTER_API_KEY is not configured")
 
@@ -83,8 +96,14 @@ async def _uno_chat(messages, models, temperature=0.4, num_predict=384):
         "Content-Type": "application/json",
     }
     errors = []
-    async with httpx.AsyncClient(timeout=UNOROUTER_TIMEOUT_SECONDS) as client:
-        for model in models:
+    model_list = _fast_model_order(models) if fast else list(models)
+
+    # Free models can occasionally stall. For interactive chat, never wait the
+    # full configured bulk timeout for a single provider.
+    per_model_timeout = min(28 if fast else 60, max(10, UNOROUTER_TIMEOUT_SECONDS))
+
+    async with httpx.AsyncClient(timeout=per_model_timeout) as client:
+        for model in model_list:
             payload = {
                 "model": model,
                 "messages": messages,
@@ -107,6 +126,9 @@ async def _uno_chat(messages, models, temperature=0.4, num_predict=384):
             except Exception as exc:
                 errors.append(f"{model}: {str(exc)[:120]}")
                 _ROUTER_STATS["uno_failures"] += 1
+                # Interactive lane tries at most two cloud models before local fallback.
+                if fast and len(errors) >= 2:
+                    break
 
     message = " | ".join(errors[-3:]) or "all UnoRouter models failed"
     _ROUTER_STATS["last_error"] = message
@@ -114,26 +136,30 @@ async def _uno_chat(messages, models, temperature=0.4, num_predict=384):
 
 
 async def chat(messages, model=None, temperature=0.4, num_predict=384, route="auto"):
-    """Route reasoning work between UnoRouter free models and local Ollama.
+    """Route reasoning work between UnoRouter and local Ollama.
 
-    Defaults:
-    - public intelligence/fact-check normalization -> UnoRouter when configured
-    - personal chat/reflection -> local Ollama unless UNOROUTER_PRIVATE_CHAT=true
-    - any cloud failure -> local Ollama fallback
-    - explicit route='local' always stays local
+    route='fast_cloud': latency-sensitive current-affairs answer; prefers flash
+    models, skips search/thinking models, and falls back quickly.
+    route='cloud': cloud allowed with normal routing.
+    route='local': always local.
     """
     public_intelligence = _looks_like_public_intelligence(messages)
     cloud_allowed = (
         UNOROUTER_ENABLED
         and bool(UNOROUTER_API_KEY)
         and route != "local"
-        and (public_intelligence or UNOROUTER_PRIVATE_CHAT or route == "cloud")
+        and (public_intelligence or UNOROUTER_PRIVATE_CHAT or route in {"cloud", "fast_cloud"})
     )
 
     if cloud_allowed:
-        models = UNOROUTER_VERIFY_MODELS if public_intelligence else UNOROUTER_CHAT_MODELS
+        if route == "fast_cloud":
+            models = UNOROUTER_CHAT_MODELS
+            fast = True
+        else:
+            models = UNOROUTER_VERIFY_MODELS if public_intelligence else UNOROUTER_CHAT_MODELS
+            fast = False
         try:
-            return await _uno_chat(messages, models, temperature, num_predict)
+            return await _uno_chat(messages, models, temperature, num_predict, fast=fast)
         except Exception as exc:
             print(f"[AI-ROUTER] UnoRouter failed; fallback=ollama error={str(exc)[:220]}")
 
@@ -148,7 +174,7 @@ def router_status():
         "chat_models": list(UNOROUTER_CHAT_MODELS),
         "verify_models": list(UNOROUTER_VERIFY_MODELS),
         "stats": dict(_ROUTER_STATS),
-        "policy": "public intelligence uses UnoRouter; personal chat stays local unless explicitly enabled",
+        "policy": "live answers use fast cloud lane; bulk fact-check uses verify lane; personal chat stays local unless enabled",
     }
 
 
