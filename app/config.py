@@ -1,8 +1,30 @@
 import os
 
+
+def _csv_env(name: str, default: str):
+    return [x.strip() for x in os.getenv(name, default).split(",") if x.strip()]
+
+
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "qwen3:8b")
 OLLAMA_EMBED_MODEL = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+
+# AI Router: keep embeddings/local fallback on Ollama, offload public/bulk reasoning to UnoRouter.
+UNOROUTER_ENABLED = os.getenv("UNOROUTER_ENABLED", "true").lower() == "true"
+UNOROUTER_BASE_URL = os.getenv("UNOROUTER_BASE_URL", "https://api.unorouter.com/v1")
+UNOROUTER_API_KEY = os.getenv("UNOROUTER_API_KEY", "").strip()
+# False by default because normal chat can include recalled personal memories.
+UNOROUTER_PRIVATE_CHAT = os.getenv("UNOROUTER_PRIVATE_CHAT", "false").lower() == "true"
+UNOROUTER_TIMEOUT_SECONDS = int(os.getenv("UNOROUTER_TIMEOUT_SECONDS", "120"))
+UNOROUTER_CHAT_MODELS = _csv_env(
+    "UNOROUTER_CHAT_MODELS",
+    "glm-5.3-flash-thinking:free,qwen3.8-flash-next:free,ling-3.0-flash-fin:free",
+)
+UNOROUTER_VERIFY_MODELS = _csv_env(
+    "UNOROUTER_VERIFY_MODELS",
+    "glm-5.3-flash-think-search:free,glm-5.3-flash-thinking:free,qwen3.8-flash-next:free",
+)
+
 DB_PATH = os.getenv("SECOND_BRAIN_DB", "second_brain.db")
 DMN_INTERVAL_MINUTES = int(os.getenv("DMN_INTERVAL_MINUTES", "30"))
 DMN_ENABLED = os.getenv("DMN_ENABLED", "true").lower() == "true"
