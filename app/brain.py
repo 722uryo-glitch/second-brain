@@ -1,20 +1,39 @@
+import asyncio
+import os
+
 from .db import recent_memories
-from .executive import run as executive_run
+from .executive import ExecutiveResult, run as executive_run
 from .memory import store_memory
 from .ollama_client import chat
 
+CHAT_HARD_TIMEOUT_SECONDS = int(os.getenv("CHAT_HARD_TIMEOUT_SECONDS", "120"))
+
 
 async def answer_detailed(user_text: str):
-    """Run the full Second Brain and return its exact ExecutiveResult."""
-    return await executive_run(user_text)
+    """Run the full Second Brain with a hard wall-clock deadline."""
+    try:
+        return await asyncio.wait_for(
+            executive_run(user_text),
+            timeout=max(30, CHAT_HARD_TIMEOUT_SECONDS),
+        )
+    except asyncio.TimeoutError:
+        print(f"[CHAT] hard timeout after {CHAT_HARD_TIMEOUT_SECONDS}s")
+        return ExecutiveResult(
+            response=(
+                "処理が時間上限に達したため、この実行を中断しました。"
+                "外部検索かAIモデルのどこかが応答待ちになった可能性があります。"
+                "無限待ちを防ぐ保護が働いた状態です。もう一度送ると、失敗したモデルのクールダウンを避けて再試行します。"
+            ),
+            memories=[],
+            run_id=None,
+            mode="timeout",
+            plan={},
+            critique={"pass": False, "issues": ["hard_timeout"]},
+        )
 
 
 async def answer(user_text: str):
-    """Backward-compatible primary chat entry point.
-
-    Every non-trivial request passes through the executive Second Brain:
-    planning -> memory/research retrieval -> drafting -> self-review -> revision.
-    """
+    """Backward-compatible primary chat entry point."""
     result = await answer_detailed(user_text)
     return result.response, result.memories
 
