@@ -1,6 +1,7 @@
 ﻿.venv/
 .env
 data/
+obsidian_vault/
 *.db
 *.sqlite
 *.sqlite3
